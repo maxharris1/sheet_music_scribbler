@@ -1,5 +1,40 @@
 # Musicality review — OMR → ScoreData → playback
 
+> **Addendum — 2026-09-02.** This review was written against the pipeline as it stood before
+> svc-5. The probe transcript, the case study and the priorities below are a record of that
+> state, not of today's; read them as history. What has been fixed since:
+>
+> - **svc-5** — dynamics resolve per staff (the P0 bleed, and with it the P3 accent that
+>   landed on the wrong note); hairpins are interpolated (P1); articulation gates sounding
+>   length, so staccato is short and slurs are not (P0); there is a real tempo map, with
+>   rit./accel./a tempo and fermatas (P1); repeats and voltas are unrolled into performance
+>   order (P1); and every warning the analysis stores is disclosed in the transport instead of
+>   being kept to ourselves.
+> - **svc-7, this pass** — D.C., D.S., segno, coda and Fine are read and performed, or refused
+>   as a whole and disclosed; the tempo map and fermatas survive the shard merge, which is what
+>   left every ≥4-page score — the Schubert case study included — at a flat fallback tempo; the
+>   opening tempo comes from a wider vocabulary, or from the meter when nothing at all is
+>   printed, and says which; sustain pedal is read (P2). On the client, the engine this
+>   document's thesis calls a MIDI note list gains a dB-domain dynamic range, reverb, keyboard
+>   panning, a velocity-tracked filter, deterministic humanization and pitch-dependent release.
+> - **svc-8** — a 4+ page score is still two shards, but the second is now parsed with the
+>   first's tempo and dynamics at the overlap, so a rit. that crossed the cut, an a tempo that
+>   opened the next page, and a pp printed only on page 1 all survive. A later movement with
+>   no heading of its own starts at its meter default rather than the previous movement's
+>   ritardando floor. Gradual marks are shaded (poco / molto) and the stepped family —
+>   meno mosso, più mosso, ritenuto, l'istesso tempo, doppio movimento — is read.
+> - **svc-9** — ornaments (trill, mordent, turn) and arpeggio signs are spelled as ordinary
+>   notes at the tempo in force; appoggiaturas take the beat and acciaccaturas scale with
+>   the pulse; a "swing" heading long–shorts pairs of eighths.
+>
+> Still open, and still described accurately below: velocity-layered samples, the measure
+> counter across concatenated movements, `totalTicks` cutting off secondary parts, and both
+> rhythm findings in the case study (No. 1's triplets, No. 2's misread meter) — those two are
+> Audiveris's limits, not ours.
+>
+> None of this reaches a document that was already analyzed until it is regenerated. The engine
+> generation bump is what puts that offer on the reader's screen.
+
 Review of what Cleffy hears when it looks at a score, and where that diverges from what a
 musician reads on the page. Findings below were verified by running the real parser
 (`services/omr-service/src/musicxml.ts`) over a grand-staff excerpt carrying ordinary piano

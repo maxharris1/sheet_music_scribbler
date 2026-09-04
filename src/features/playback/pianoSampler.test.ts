@@ -1,16 +1,22 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+    LAYER_LOUD_VELOCITY,
+    LAYER_MID_VELOCITY,
+    LAYER_SOFT_VELOCITY,
     MAX_ATTACK_LAG_S,
     PIANO_ANCHORS,
     anchorFileName,
+    anchorUrl,
     detectAttackLagSec,
     detectOnsetSec,
+    layersBracketing,
     loadPianoBuffers,
     nearestAnchor,
     playbackRateFor,
     resetPianoBufferCache,
 } from '@/features/playback/pianoSampler';
+import type { PianoLayer } from '@/features/playback/pianoSampler';
 
 const stubBuffer = (leadingSilenceSamples: number, sampleRate = 22050): AudioBuffer => {
     const data = new Float32Array(leadingSilenceSamples + 1000);
@@ -119,22 +125,134 @@ describe('detectAttackLagSec', () => {
     });
 });
 
+const layer = (velocity: number, id?: string): PianoLayer => ({
+    buffer: { id } as unknown as AudioBuffer,
+    onsetSec: 0,
+    attackLagSec: 0,
+    velocity,
+});
+
+const threeLayers = (): PianoLayer[] => [
+    layer(LAYER_SOFT_VELOCITY, 'soft'),
+    layer(LAYER_MID_VELOCITY, 'mid'),
+    layer(LAYER_LOUD_VELOCITY, 'loud'),
+];
+
+describe('anchorUrl', () => {
+    it('names the mid file with no suffix and the extra layers with -soft/-loud', () => {
+        expect(anchorUrl(60)).toBe('/audio/piano/C4.mp3');
+        expect(anchorUrl(60, '-soft')).toBe('/audio/piano/C4-soft.mp3');
+        expect(anchorUrl(60, '-loud')).toBe('/audio/piano/C4-loud.mp3');
+    });
+});
+
+describe('layersBracketing', () => {
+    const layers = threeLayers();
+    const soft = layers[0]!;
+    const mid = layers[1]!;
+    const loud = layers[2]!;
+
+    it('clamps below the softest layer to that layer alone', () => {
+        expect(layersBracketing(layers, 0.1)).toEqual({ low: soft, high: soft, mix: 0 });
+    });
+
+    it('sits on the soft layer at its own velocity', () => {
+        expect(layersBracketing(layers, LAYER_SOFT_VELOCITY)).toEqual({ low: soft, high: soft, mix: 0 });
+    });
+
+    it('crossfades soft and mid with mix 0.5 at their midpoint', () => {
+        const { low, high, mix } = layersBracketing(layers, 0.38);
+        expect(low).toBe(soft);
+        expect(high).toBe(mid);
+        expect(mix).toBeCloseTo(0.5, 10);
+    });
+
+    it('sits on the mid layer at its own velocity', () => {
+        expect(layersBracketing(layers, LAYER_MID_VELOCITY)).toEqual({ low: mid, high: mid, mix: 0 });
+    });
+
+    it('crossfades mid and loud above the mid layer', () => {
+        const { low, high, mix } = layersBracketing(layers, 0.7);
+        expect(low).toBe(mid);
+        expect(high).toBe(loud);
+        expect(mix).toBeCloseTo((0.7 - LAYER_MID_VELOCITY) / (LAYER_LOUD_VELOCITY - LAYER_MID_VELOCITY), 10);
+    });
+
+    it('clamps above the loudest layer to that layer alone', () => {
+        expect(layersBracketing(layers, 0.9)).toEqual({ low: loud, high: loud, mix: 1 });
+    });
+
+    it('always returns the mid layer when that is the only one loaded', () => {
+        const onlyMid = [mid];
+        expect(layersBracketing(onlyMid, 0.1)).toEqual({ low: mid, high: mid, mix: 0 });
+        expect(layersBracketing(onlyMid, 0.54)).toEqual({ low: mid, high: mid, mix: 0 });
+        expect(layersBracketing(onlyMid, 0.9)).toEqual({ low: mid, high: mid, mix: 0 });
+    });
+});
+
 describe('loadPianoBuffers', () => {
-    it('decodes every anchor with its onset and caches the result', async () => {
-        const fetchImpl = vi.fn(async () => ({ ok: true, arrayBuffer: async () => new ArrayBuffer(8) })) as unknown as typeof fetch;
+    it('decodes every mid-layer anchor with its onset and caches the result', async () => {
+        const fetchImpl = vi.fn(async (_url: string) => ({
+            ok: true,
+            arrayBuffer: async () => new ArrayBuffer(8),
+        }));
         const decoder = { decodeAudioData: vi.fn(async () => stubBuffer(1102)) };
-        const voices = await loadPianoBuffers(decoder, fetchImpl);
+        const voices = await loadPianoBuffers(decoder, fetchImpl as unknown as typeof fetch);
         expect(voices.size).toBe(PIANO_ANCHORS.length);
-        expect(voices.get(60)?.onsetSec).toBeCloseTo(0.048, 3); // ~50ms padding skipped
-        await loadPianoBuffers(decoder, fetchImpl);
-        expect(fetchImpl).toHaveBeenCalledTimes(PIANO_ANCHORS.length); // second call served from cache
+        expect(voices.get(60)?.[0]?.onsetSec).toBeCloseTo(0.048, 3); // ~50ms padding skipped
+        expect(voices.get(60)?.[0]?.velocity).toBe(LAYER_MID_VELOCITY);
+        const midCalls = () =>
+            fetchImpl.mock.calls.filter(
+                ([url]) => typeof url === 'string' && !url.includes('-soft') && !url.includes('-loud'),
+            ).length;
+        expect(midCalls()).toBe(PIANO_ANCHORS.length);
+        await loadPianoBuffers(decoder, fetchImpl as unknown as typeof fetch);
+        expect(midCalls()).toBe(PIANO_ANCHORS.length); // second call served from cache
     });
 
     it('clears the cache on failure so a retry can succeed', async () => {
-        const failing = vi.fn(async () => ({ ok: false, status: 503, arrayBuffer: async () => new ArrayBuffer(0) })) as unknown as typeof fetch;
+        const failing = vi.fn(async () => ({
+            ok: false,
+            status: 503,
+            arrayBuffer: async () => new ArrayBuffer(0),
+        })) as unknown as typeof fetch;
         const decoder = { decodeAudioData: vi.fn(async () => stubBuffer(0)) };
         await expect(loadPianoBuffers(decoder, failing)).rejects.toThrow('HTTP 503');
-        const working = vi.fn(async () => ({ ok: true, arrayBuffer: async () => new ArrayBuffer(8) })) as unknown as typeof fetch;
+        const working = vi.fn(async () => ({
+            ok: true,
+            arrayBuffer: async () => new ArrayBuffer(8),
+        })) as unknown as typeof fetch;
         await expect(loadPianoBuffers(decoder, working)).resolves.toBeDefined();
+    });
+
+    it('resolves after the mid layer and appends soft/loud as those fetches land', async () => {
+        const pending = new Map<string, (value: { ok: boolean; arrayBuffer: () => Promise<ArrayBuffer> }) => void>();
+        const fetchImpl = vi.fn((url: string) => {
+            return new Promise<{ ok: boolean; arrayBuffer: () => Promise<ArrayBuffer> }>((resolve) => {
+                pending.set(url, resolve);
+            });
+        }) as unknown as typeof fetch;
+        const decoder = { decodeAudioData: vi.fn(async () => stubBuffer(0)) };
+
+        const loading = loadPianoBuffers(decoder, fetchImpl);
+        await vi.waitFor(() => expect(pending.size).toBe(PIANO_ANCHORS.length));
+        for (const midi of PIANO_ANCHORS) {
+            pending.get(anchorUrl(midi))?.({ ok: true, arrayBuffer: async () => new ArrayBuffer(8) });
+        }
+        const buffers = await loading;
+        expect(buffers.get(60)).toHaveLength(1);
+        expect(buffers.get(60)?.[0]?.velocity).toBe(LAYER_MID_VELOCITY);
+
+        await vi.waitFor(() => expect(pending.has(anchorUrl(60, '-soft'))).toBe(true));
+        expect(pending.has(anchorUrl(60, '-loud'))).toBe(true);
+        expect(buffers.get(60)).toHaveLength(1);
+
+        for (const midi of PIANO_ANCHORS) {
+            pending.get(anchorUrl(midi, '-soft'))?.({ ok: true, arrayBuffer: async () => new ArrayBuffer(8) });
+            pending.get(anchorUrl(midi, '-loud'))?.({ ok: true, arrayBuffer: async () => new ArrayBuffer(8) });
+        }
+        await vi.waitFor(() => expect(buffers.get(60)).toHaveLength(3));
+        const velocities = (buffers.get(60) ?? []).map((entry) => entry.velocity);
+        expect(velocities).toEqual([LAYER_SOFT_VELOCITY, LAYER_MID_VELOCITY, LAYER_LOUD_VELOCITY]);
     });
 });

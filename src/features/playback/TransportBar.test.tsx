@@ -21,7 +21,13 @@ const makeEngine = () => {
 const renderBar = (overrides: Partial<TransportBarProps> = {}) => {
     const engine = makeEngine();
     const props: TransportBarProps = {
-        state: { kind: 'ready', score: tinyScore, bpmDefault: 90, bpmOverride: null, engineVersion: 'audiveris-5.6.1+svc-5' },
+        state: {
+            kind: 'ready',
+            score: tinyScore,
+            bpmDefault: 90,
+            bpmOverride: null,
+            engineVersion: 'audiveris-5.6.1+svc-5',
+        },
         role: 'owner',
         onGenerate: vi.fn(),
         getEngine: () => engine,
@@ -115,12 +121,28 @@ describe('TransportBar ready controls', () => {
                 { tick: 960, num: 3, den: 8 },
             ],
         };
-        renderBar({ state: { kind: 'ready', score: shifting, bpmDefault: null, bpmOverride: null, engineVersion: 'audiveris-5.6.1+svc-5' } });
+        renderBar({
+            state: {
+                kind: 'ready',
+                score: shifting,
+                bpmDefault: null,
+                bpmOverride: null,
+                engineVersion: 'audiveris-5.6.1+svc-5',
+            },
+        });
         expect(screen.getByLabelText('Time signature 4/4')).toBeInTheDocument();
 
         cleanup();
         setStore(() => useViewerStore.getState().setCurrentMeasureIndex(3)); // tick 1440
-        renderBar({ state: { kind: 'ready', score: shifting, bpmDefault: null, bpmOverride: null, engineVersion: 'audiveris-5.6.1+svc-5' } });
+        renderBar({
+            state: {
+                kind: 'ready',
+                score: shifting,
+                bpmDefault: null,
+                bpmOverride: null,
+                engineVersion: 'audiveris-5.6.1+svc-5',
+            },
+        });
         expect(screen.getByLabelText('Time signature 3/8')).toBeInTheDocument();
     });
 
@@ -165,7 +187,15 @@ describe('TransportBar ready controls', () => {
 
     it('disables the left hand for single-staff scores', () => {
         const rhOnly = { ...tinyScore, notes: tinyScore.notes.filter((n) => n.h === 0) };
-        renderBar({ state: { kind: 'ready', score: rhOnly, bpmDefault: null, bpmOverride: null, engineVersion: 'audiveris-5.6.1+svc-5' } });
+        renderBar({
+            state: {
+                kind: 'ready',
+                score: rhOnly,
+                bpmDefault: null,
+                bpmOverride: null,
+                engineVersion: 'audiveris-5.6.1+svc-5',
+            },
+        });
         expect(screen.getByRole('button', { name: /mute left hand/i })).toBeDisabled();
     });
 
@@ -214,7 +244,15 @@ describe('TransportBar ready controls', () => {
     it('shows the dotted-quarter equivalent for compound meters', () => {
         setStore(() => useViewerStore.getState().setBpm(90));
         const compound = { ...tinyScore, timeSignatures: [{ tick: 0, num: 6, den: 8 }] };
-        renderBar({ state: { kind: 'ready', score: compound, bpmDefault: null, bpmOverride: null, engineVersion: 'audiveris-5.6.1+svc-5' } });
+        renderBar({
+            state: {
+                kind: 'ready',
+                score: compound,
+                bpmDefault: null,
+                bpmOverride: null,
+                engineVersion: 'audiveris-5.6.1+svc-5',
+            },
+        });
         expect(screen.getByText(/♩· = 60/)).toBeInTheDocument();
 
         cleanup();
@@ -269,6 +307,29 @@ describe('analysis warnings', () => {
         expect(items[0]).toMatch(/repeats/i);
     });
 
+    it('warns before the bar count starts revisiting bars', async () => {
+        withWarnings(['jumps_performed']);
+        await userEvent.click(screen.getByRole('button', { name: /1 thing to know/i }));
+        expect(screen.getByText(/playhead jumps back/i)).toBeInTheDocument();
+    });
+
+    it('explains a roadmap it could not follow and a tempo nobody printed', async () => {
+        withWarnings(['jumps_ignored', 'tempo_defaulted', 'tempo_inferred']);
+        await userEvent.click(screen.getByRole('button', { name: /3 things to know/i }));
+        expect(screen.getByText(/plays straight through in page order/i)).toBeInTheDocument();
+        expect(screen.getByText(/chosen from the time signature/i)).toBeInTheDocument();
+        expect(screen.getByText(/estimated from the tempo word/i)).toBeInTheDocument();
+    });
+
+    it('explains realised ornaments and swung eighths', async () => {
+        withWarnings(['ornaments_realized', 'swing_applied']);
+        await userEvent.click(screen.getByRole('button', { name: /2 things to know/i }));
+        expect(
+            screen.getByText(/trills, mordents, turns and arpeggio signs are played out as written/i),
+        ).toBeInTheDocument();
+        expect(screen.getByText(/pairs of eighth notes are played long–short/i)).toBeInTheDocument();
+    });
+
     it('ignores codes it has no copy for rather than leaking them raw', () => {
         withWarnings(['something_new_from_the_service']);
         expect(screen.queryByRole('button', { name: /things? to know/i })).toBeNull();
@@ -277,7 +338,11 @@ describe('analysis warnings', () => {
 });
 
 describe('tempo disclosure and stale analyses', () => {
-    const ready = (over: Partial<Parameters<typeof renderBar>[0]> = {}, score = tinyScore, engine: string | null = 'audiveris-5.6.1+svc-5') =>
+    const ready = (
+        over: Partial<Parameters<typeof renderBar>[0]> = {},
+        score = tinyScore,
+        engine: string | null = 'audiveris-5.6.1+svc-9',
+    ) =>
         renderBar({
             state: { kind: 'ready', score, bpmDefault: 90, bpmOverride: null, engineVersion: engine },
             ...over,
@@ -290,6 +355,36 @@ describe('tempo disclosure and stale analyses', () => {
 
     it('does not mark a printed tempo as estimated', () => {
         ready({}, { ...tinyScore, tempos: [{ tick: 0, bpm: 94, src: 'metronome' }] });
+        expect(screen.queryByText('est.')).toBeNull();
+    });
+
+    /**
+     * Warnings are score-wide: a shard covering the second half prints no tempo
+     * of its own and says so, which must not cast doubt on the metronome mark
+     * engraved at the top of the first page.
+     */
+    it('leaves a printed tempo alone when a later part of the score guessed one', () => {
+        ready({}, { ...tinyScore, tempos: [{ tick: 0, bpm: 94, src: 'metronome' }], warnings: ['tempo_defaulted'] });
+        expect(screen.queryByText('est.')).toBeNull();
+    });
+
+    it('says the tempo came from the meter when the score prints none at all', () => {
+        ready({}, { ...tinyScore, tempos: undefined, warnings: ['tempo_defaulted'] });
+        expect(screen.getByText('est.').getAttribute('title')).toMatch(/time signature/i);
+    });
+
+    it('says the tempo came off a tempo word when one was printed without a number', () => {
+        ready({}, { ...tinyScore, tempos: [{ tick: 0, bpm: 94, src: 'word' }] });
+        expect(screen.getByText('est.').getAttribute('title')).toMatch(/tempo marking/i);
+    });
+
+    it('says the meter guessed the opening when a tempo word arrives later', () => {
+        ready({}, { ...tinyScore, tempos: [{ tick: 960, bpm: 120, src: 'word' }], warnings: ['tempo_defaulted'] });
+        expect(screen.getByText('est.').getAttribute('title')).toMatch(/time signature/i);
+    });
+
+    it('does not treat a later tempo word as the opening estimate', () => {
+        ready({}, { ...tinyScore, tempos: [{ tick: 960, bpm: 120, src: 'word' }], warnings: [] });
         expect(screen.queryByText('est.')).toBeNull();
     });
 
@@ -345,5 +440,33 @@ describe('repeated bars in the measure counter', () => {
         renderWith(tinyScore);
         act(() => useViewerStore.getState().setLoopRange({ a: 0, b: 2 }));
         expect(document.body.textContent).not.toMatch(/\(1st\)|\(2nd\)/);
+    });
+
+    /**
+     * "D.C. al Fine": bars 1–24, then 1–12 again, and the playthrough stops on
+     * the Fine bar. The last bar performed is m. 12, but the score is still 24
+     * bars long — counting against the performance would print "m. 21 / 12".
+     */
+    it('counts against the printed extent when a jump ends the playthrough early', () => {
+        const printed = Array.from({ length: 24 }, (_, i) => ({
+            n: i + 1,
+            tick: i * 1920,
+            dTicks: 1920,
+            page: 0,
+            sys: 0,
+            x0: 0.08,
+            x1: 0.92,
+            srcIndex: i,
+        }));
+        const alFine = {
+            ...tinyScore,
+            measures: [...printed, ...printed.slice(0, 12).map((m, i) => ({ ...m, tick: (24 + i) * 1920 }))],
+            totalTicks: 36 * 1920,
+            warnings: ['jumps_performed'],
+        };
+
+        setStore(() => useViewerStore.getState().setCurrentMeasureIndex(20)); // m. 21, first pass
+        renderWith(alFine);
+        expect(screen.getByText('m. 21 / 24')).toBeInTheDocument();
     });
 });

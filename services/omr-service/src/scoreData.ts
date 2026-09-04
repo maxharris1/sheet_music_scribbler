@@ -7,7 +7,7 @@ import { z } from 'zod';
  */
 
 /** Writer version for newly built analyses. */
-export const SCORE_DATA_VERSION = 3;
+export const SCORE_DATA_VERSION = 4;
 export const TICKS_PER_QUARTER = 480;
 
 /**
@@ -110,6 +110,18 @@ const scoreHoldSchema = z.object({
     beats: z.number().positive().max(16),
 });
 
+/**
+ * One sustain-pedal edge. Edges rather than spans: OMR routinely loses one end
+ * of a pedal line, and a missing edge costs a single note's ring instead of
+ * invalidating a whole span. A re-catch (MusicXML `change`) is two edges on the
+ * same tick, 'up' before 'down' — order carries the meaning, so anything
+ * re-sorting this array must sort stably. v4+.
+ */
+const scorePedalSchema = z.object({
+    tick: z.number().int().nonnegative(),
+    k: z.enum(['down', 'up']),
+});
+
 export const scoreDataSchema = z.object({
     version: z.number().int(),
     ticksPerQuarter: z.literal(TICKS_PER_QUARTER),
@@ -121,6 +133,8 @@ export const scoreDataSchema = z.object({
     tempos: z.array(scoreTempoSchema).max(512).optional(),
     /** v3+; fermata holds. */
     holds: z.array(scoreHoldSchema).max(128).optional(),
+    /** v4+; sustain-pedal edges in tick order. */
+    pedals: z.array(scorePedalSchema).max(256).optional(),
     totalTicks: z.number().int().positive(),
     notes: z.array(scoreNoteSchema).max(50_000),
     measures: z.array(scoreMeasureSchema).max(2_000),
@@ -136,4 +150,5 @@ export type ScoreKeySig = z.infer<typeof scoreKeySigSchema>;
 export type ScoreClef = z.infer<typeof scoreClefSchema>;
 export type ScoreTempo = z.infer<typeof scoreTempoSchema>;
 export type ScoreHold = z.infer<typeof scoreHoldSchema>;
+export type ScorePedal = z.infer<typeof scorePedalSchema>;
 export type ScoreData = z.infer<typeof scoreDataSchema>;

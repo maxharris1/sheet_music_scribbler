@@ -1,8 +1,8 @@
 /**
  * Bundled piano voice: 29 Salamander Grand anchors (every minor third,
- * C1–C8) served from /audio/piano and pitch-shifted at most ±1.5 semitones
- * via playbackRate. Regenerate the files with scripts/fetch-piano-samples.mjs
- * (keep ANCHOR list and that script in sync).
+ * C1–C8) at three velocity layers, served from /audio/piano and pitch-shifted
+ * at most ±1.5 semitones via playbackRate. Regenerate the files with
+ * scripts/fetch-piano-samples.mjs (keep ANCHOR list and that script in sync).
  *
  * Sample credit: Salamander Grand Piano by Alexander Holm, CC BY 3.0.
  */
@@ -19,13 +19,20 @@ export const PIANO_ANCHORS: readonly number[] = Array.from(
     (_, i) => FIRST_ANCHOR_MIDI + i * ANCHOR_STEP,
 );
 
-export const anchorFileName = (midi: number): string => {
+/** Soft layer (Salamander v4) — fallback if layers.json is not fetched. */
+export const LAYER_SOFT_VELOCITY = 0.22;
+/** Mid layer (Salamander v9) — the filename with no suffix, loaded first. */
+export const LAYER_MID_VELOCITY = 0.54;
+/** Loud layer (Salamander v14). */
+export const LAYER_LOUD_VELOCITY = 0.85;
+
+export const anchorFileName = (midi: number, suffix = ''): string => {
     const name = NOTE_NAMES[((midi % 12) + 12) % 12];
     const octave = Math.floor(midi / 12) - 1;
-    return `${name}${octave}.mp3`;
+    return `${name}${octave}${suffix}.mp3`;
 };
 
-export const anchorUrl = (midi: number): string => `/audio/piano/${anchorFileName(midi)}`;
+export const anchorUrl = (midi: number, suffix = ''): string => `/audio/piano/${anchorFileName(midi, suffix)}`;
 
 /** Nearest bundled anchor for a pitch (ties resolve downward — stretching up stays brighter). */
 export const nearestAnchor = (midi: number): number => {
@@ -56,7 +63,58 @@ export interface PianoVoice {
     attackLagSec: number;
 }
 
-export type PianoBuffers = Map<number, PianoVoice>;
+export type PianoLayer = PianoVoice & {
+    /** Nominal struck velocity this sample was recorded at, in 0..1. */
+    velocity: number;
+};
+
+/** Per-anchor layers, sorted ascending by velocity. Mid is present first; soft/loud append later. */
+export type PianoBuffers = Map<number, PianoLayer[]>;
+
+export const layersFor = (buffers: PianoBuffers, anchor: number): PianoLayer[] => buffers.get(anchor) ?? [];
+
+export interface LayerBracket {
+    low: PianoLayer;
+    high: PianoLayer;
+    /** Weight of `high` in [0, 1]. 0/1 with `low === high` means a single layer. */
+    mix: number;
+}
+
+/**
+ * The two (or one) layers that should speak at `velocity`. Below the softest
+ * or above the loudest is a single layer, not an extrapolation; sitting
+ * exactly on a layer is that layer alone. Mix is the equal-power weight of
+ * `high` when two neighbours bracket the strike.
+ */
+export const layersBracketing = (layers: readonly PianoLayer[], velocity: number): LayerBracket => {
+    const first = layers[0];
+    if (!first) {
+        throw new Error('layersBracketing: no layers');
+    }
+    if (layers.length === 1 || velocity <= first.velocity) {
+        return { low: first, high: first, mix: 0 };
+    }
+    const last = layers[layers.length - 1] ?? first;
+    if (velocity >= last.velocity) {
+        return { low: last, high: last, mix: 1 };
+    }
+    for (let i = 0; i < layers.length - 1; i++) {
+        const low = layers[i];
+        const high = layers[i + 1];
+        if (!low || !high) {
+            continue;
+        }
+        if (velocity <= low.velocity) {
+            return { low, high: low, mix: 0 };
+        }
+        if (velocity >= high.velocity) {
+            continue;
+        }
+        const span = high.velocity - low.velocity;
+        return { low, high, mix: span > 0 ? (velocity - low.velocity) / span : 0 };
+    }
+    return { low: last, high: last, mix: 1 };
+};
 
 /**
  * Where the note's attack truly starts inside a decoded sample. mp3 decoding
@@ -137,28 +195,84 @@ export const detectAttackLagSec = (buffer: AudioBuffer, onsetSec: number): numbe
     return 0;
 };
 
+const voiceFrom = async (decoder: SampleDecoder, data: ArrayBuffer, velocity: number): Promise<PianoLayer> => {
+    const buffer = await decoder.decodeAudioData(data);
+    const onsetSec = detectOnsetSec(buffer);
+    return { buffer, onsetSec, attackLagSec: detectAttackLagSec(buffer, onsetSec), velocity };
+};
+
+const loadLayer = async (
+    decoder: SampleDecoder,
+    fetchImpl: typeof fetch,
+    midi: number,
+    suffix: string,
+    velocity: number,
+): Promise<PianoLayer> => {
+    const res = await fetchImpl(anchorUrl(midi, suffix));
+    if (!res.ok) {
+        throw new Error(`Piano sample ${anchorFileName(midi, suffix)}: HTTP ${res.status}`);
+    }
+    return voiceFrom(decoder, await res.arrayBuffer(), velocity);
+};
+
+const EXTRA_LAYERS: ReadonlyArray<{ suffix: string; velocity: number }> = [
+    { suffix: '-soft', velocity: LAYER_SOFT_VELOCITY },
+    { suffix: '-loud', velocity: LAYER_LOUD_VELOCITY },
+];
+
+/** Soft/loud fill the same map the mid layer already resolved; failures stay mid-only. */
+const fillExtraLayers = (buffers: PianoBuffers, decoder: SampleDecoder, fetchImpl: typeof fetch): void => {
+    void (async () => {
+        const extras = await Promise.all(
+            PIANO_ANCHORS.flatMap((midi) =>
+                EXTRA_LAYERS.map(async ({ suffix, velocity }) => {
+                    try {
+                        const layer = await loadLayer(decoder, fetchImpl, midi, suffix, velocity);
+                        return { midi, layer };
+                    } catch {
+                        return null;
+                    }
+                }),
+            ),
+        );
+        for (const extra of extras) {
+            if (!extra) {
+                continue;
+            }
+            const layers = buffers.get(extra.midi);
+            if (!layers) {
+                continue;
+            }
+            layers.push(extra.layer);
+            layers.sort((a, b) => a.velocity - b.velocity);
+        }
+    })();
+};
+
 let cache: Promise<PianoBuffers> | null = null;
 
 /**
- * Fetch + decode all anchors in parallel, once per app lifetime (~0.85 MB
- * over the wire; the service worker CacheFirst route makes replays and
- * offline sessions free). Failure clears the cache so a retry can succeed.
+ * Fetch + decode the mid layer of every anchor in parallel, once per app
+ * lifetime, and resolve as soon as those are in — the same filenames and
+ * timing the single-layer loader had. Soft and loud then fill the same map
+ * entries in the background, so a voice scheduled before they land simply
+ * plays the mid sample.
+ *
+ * Failure of the mid layer clears the cache so a retry can succeed. Extra
+ * layers that 404 are skipped; the mid sample stays.
  */
 export const loadPianoBuffers = (decoder: SampleDecoder, fetchImpl: typeof fetch = fetch): Promise<PianoBuffers> => {
     if (!cache) {
         cache = (async () => {
             const entries = await Promise.all(
-                PIANO_ANCHORS.map(async (midi): Promise<[number, PianoVoice]> => {
-                    const res = await fetchImpl(anchorUrl(midi));
-                    if (!res.ok) {
-                        throw new Error(`Piano sample ${anchorFileName(midi)}: HTTP ${res.status}`);
-                    }
-                    const buffer = await decoder.decodeAudioData(await res.arrayBuffer());
-                    const onsetSec = detectOnsetSec(buffer);
-                    return [midi, { buffer, onsetSec, attackLagSec: detectAttackLagSec(buffer, onsetSec) }];
+                PIANO_ANCHORS.map(async (midi): Promise<[number, PianoLayer[]]> => {
+                    const layer = await loadLayer(decoder, fetchImpl, midi, '', LAYER_MID_VELOCITY);
+                    return [midi, [layer]];
                 }),
             );
-            return new Map(entries);
+            const buffers = new Map(entries);
+            fillExtraLayers(buffers, decoder, fetchImpl);
+            return buffers;
         })().catch((err: unknown) => {
             cache = null;
             throw err;

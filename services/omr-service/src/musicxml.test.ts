@@ -1,6 +1,12 @@
+import { readFileSync } from 'node:fs';
+
+import AdmZip from 'adm-zip';
 import { describe, expect, it } from 'vitest';
 
-import { parseMusicXmlString } from './musicxml.js';
+import { buildScoreData } from './buildScoreData.js';
+import { mergeScoreDataParts } from './mergeScoreData.js';
+import { parseMusicXmlString, parseMxlFiles, expressionSeedAt } from './musicxml.js';
+import { SCORE_DATA_VERSION, TICKS_PER_QUARTER, scoreDataSchema } from './scoreData.js';
 
 const wrap = (measures: string, extraParts = ''): string => `<?xml version="1.0"?>
 <score-partwise version="4.0">
@@ -214,7 +220,7 @@ describe('parseMusicXmlString', () => {
         );
         const score = parseMusicXmlString(xml);
         expect(score.notes).toEqual([
-            { t: 370, d: 110, p: 62, h: 0, v: 0.6 }, // acciaccatura — never gated
+            { t: 419, d: 61, p: 62, h: 0, v: 0.6 }, // acciaccatura — never gated; 96 bpm → 61 ticks
             { t: 480, d: plain(480), p: 64, h: 0 },
         ]);
         expect(score.warnings).not.toContain('grace_notes_skipped');
@@ -282,13 +288,16 @@ describe('parseMusicXmlString', () => {
         ]);
     });
 
-    it('warns on repeat barlines but keeps a linear timeline', () => {
+    it('records repeat barlines on a linear timeline, and judges nothing', () => {
         const xml = wrap(
             `<measure number="1">${ATTRS_44}${note('C', 4, 16)}<barline location="right"><repeat direction="backward"/></barline></measure>
              <measure number="2">${note('D', 4, 16)}</measure>`,
         );
         const score = parseMusicXmlString(xml);
-        expect(score.warnings).toContain('repeats_ignored');
+        // Whether a repeat was performed, ignored, or never needed saying is
+        // buildScoreData's call — the parser only reports what is engraved.
+        expect(score.warnings).not.toContain('repeats_ignored');
+        expect(score.repeats[0]).toMatchObject({ repeatBackward: true });
         expect(score.measures.map((m) => m.tick)).toEqual([0, 1920]);
     });
 
@@ -339,9 +348,7 @@ describe('dynamics resolution', () => {
         // The headline regression: MusicXML writes [staff 1] <backup> [staff 2],
         // so the left hand's mark used to be the last one seen in the bar and
         // silently became the right hand's dynamic from the next bar onward.
-        const xml = wrap(
-            twoHandBar(`${GRAND}${dyn('f', 1)}`, dyn('p', 2)) + twoHandBar() + twoHandBar(),
-        );
+        const xml = wrap(twoHandBar(`${GRAND}${dyn('f', 1)}`, dyn('p', 2)) + twoHandBar() + twoHandBar());
         const score = parseMusicXmlString(xml);
         expect(at(score, 0, 0)).toEqual([0.82, 0.82, 0.82, 0.82]);
         expect(at(score, 1, 0)).toEqual([0.46]);
@@ -384,9 +391,7 @@ describe('dynamics resolution', () => {
     it('keeps an established left-hand dynamic when a later mark names only staff 1', () => {
         // Independence is sticky: a lone staff-1 ff in bar 3 must not silently
         // overwrite the p the left hand was given in bar 1.
-        const xml = wrap(
-            twoHandBar(`${GRAND}${dyn('f', 1)}`, dyn('p', 2)) + twoHandBar() + twoHandBar(dyn('ff', 1)),
-        );
+        const xml = wrap(twoHandBar(`${GRAND}${dyn('f', 1)}`, dyn('p', 2)) + twoHandBar() + twoHandBar(dyn('ff', 1)));
         const score = parseMusicXmlString(xml);
         expect(at(score, 0, 3840)).toEqual([0.92, 0.92, 0.92, 0.92]);
         expect(at(score, 1, 3840)).toEqual([0.46]);
@@ -395,9 +400,7 @@ describe('dynamics resolution', () => {
     it('re-unifies both hands on an unattributed dynamic after a split', () => {
         // In a file that attributes when it means to, a mark with no staff is a
         // whole-texture marking and overrides the separation.
-        const xml = wrap(
-            twoHandBar(`${GRAND}${dyn('f', 1)}`, dyn('p', 2)) + twoHandBar(dyn('pp')) + twoHandBar(),
-        );
+        const xml = wrap(twoHandBar(`${GRAND}${dyn('f', 1)}`, dyn('p', 2)) + twoHandBar(dyn('pp')) + twoHandBar());
         const score = parseMusicXmlString(xml);
         expect(at(score, 0, 3840)).toEqual([0.34, 0.34, 0.34, 0.34]);
         expect(at(score, 1, 3840)).toEqual([0.34]);
@@ -461,9 +464,7 @@ describe('dynamics resolution', () => {
             score.notes.filter((n) => n.h === 0).map((n) => n.v);
 
         it('interpolates between the dynamic before and the one after', () => {
-            const xml = wrap(
-                rhBar(`${GRAND}${dyn('p')}${wedge('crescendo')}`, wedge('stop')) + rhBar(dyn('f')),
-            );
+            const xml = wrap(rhBar(`${GRAND}${dyn('p')}${wedge('crescendo')}`, wedge('stop')) + rhBar(dyn('f')));
             const got = rh(parseMusicXmlString(xml));
             expect(got[0]).toBe(0.46); // p, at the wedge start
             expect(got[4]).toBe(0.82); // f, at the wedge end
@@ -665,7 +666,7 @@ describe('articulation', () => {
                 `<note><grace/><pitch><step>D</step><octave>4</octave></pitch><voice>1</voice></note>` +
                 `${note('E', 4, 4, arts('staccato'))}${note('F', 4, 8)}`,
         );
-        expect(durs(xml)[0]).toBe(110);
+        expect(durs(xml)[0]).toBe(61);
     });
 });
 
@@ -686,7 +687,13 @@ describe('meter reconciliation', () => {
 
     it('corrects a signature the over-length bars outvote, and re-signs the timeline', () => {
         // 12 bars of true 9/8 (18 sixteenths = 2160 ticks) declared as 6/8.
-        const score = parseMusicXmlString(spanOf(6, 8, Array.from({ length: 12 }, () => 18)));
+        const score = parseMusicXmlString(
+            spanOf(
+                6,
+                8,
+                Array.from({ length: 12 }, () => 18),
+            ),
+        );
         expect(score.timeSignatures).toEqual([{ tick: 0, num: 9, den: 8 }]);
         expect(score.measures.every((m) => m.dTicks === 2160)).toBe(true);
         expect(score.warnings).toContain('meter_corrected');
@@ -714,7 +721,13 @@ describe('meter reconciliation', () => {
     });
 
     it('leaves a genuine signature alone when its bars agree', () => {
-        const score = parseMusicXmlString(spanOf(6, 8, Array.from({ length: 12 }, () => 12)));
+        const score = parseMusicXmlString(
+            spanOf(
+                6,
+                8,
+                Array.from({ length: 12 }, () => 12),
+            ),
+        );
         expect(score.timeSignatures).toEqual([{ tick: 0, num: 6, den: 8 }]);
         expect(score.warnings).not.toContain('meter_corrected');
         expect(score.warnings).not.toContain('meter_suspect');
@@ -729,7 +742,13 @@ describe('meter reconciliation', () => {
 
     it('warns but does not act when the disagreement is not a simple misread', () => {
         // 1800 vs 1440 is 5:4 — not a ratio a signature misread produces.
-        const score = parseMusicXmlString(spanOf(6, 8, Array.from({ length: 12 }, () => 15)));
+        const score = parseMusicXmlString(
+            spanOf(
+                6,
+                8,
+                Array.from({ length: 12 }, () => 15),
+            ),
+        );
         expect(score.timeSignatures).toEqual([{ tick: 0, num: 6, den: 8 }]);
         expect(score.warnings).toContain('meter_suspect');
         expect(score.warnings).not.toContain('meter_corrected');
@@ -748,7 +767,13 @@ describe('meter reconciliation', () => {
     });
 
     it('reads 4/4 misdeclared as 2/4', () => {
-        const score = parseMusicXmlString(spanOf(2, 4, Array.from({ length: 12 }, () => 16)));
+        const score = parseMusicXmlString(
+            spanOf(
+                2,
+                4,
+                Array.from({ length: 12 }, () => 16),
+            ),
+        );
         expect(score.timeSignatures).toEqual([{ tick: 0, num: 4, den: 4 }]);
         expect(score.warnings).toContain('meter_corrected');
     });
@@ -794,9 +819,7 @@ describe('tempo', () => {
     const bar = (lead = ''): string => `<measure>${lead}${note('C', 4, 16)}</measure>`;
 
     it('collects every tempo mark, not just the first', () => {
-        const score = parseMusicXmlString(
-            wrap(bar(`${ATTRS_44}${soundTempo(120)}`) + bar(soundTempo(60)) + bar()),
-        );
+        const score = parseMusicXmlString(wrap(bar(`${ATTRS_44}${soundTempo(120)}`) + bar(soundTempo(60)) + bar()));
         expect(score.tempos).toEqual([
             { tick: 0, bpm: 120, src: 'sound' },
             { tick: 1920, bpm: 60, src: 'sound' },
@@ -817,9 +840,7 @@ describe('tempo', () => {
     });
 
     it('lets a printed number anywhere beat a word everywhere', () => {
-        const score = parseMusicXmlString(
-            wrap(bar(`${ATTRS_44}${words('Adagio')}`) + bar(soundTempo(144)) + bar()),
-        );
+        const score = parseMusicXmlString(wrap(bar(`${ATTRS_44}${words('Adagio')}`) + bar(soundTempo(144)) + bar()));
         expect(score.tempos).toEqual([{ tick: 1920, bpm: 144, src: 'sound' }]);
         expect(score.warnings).not.toContain('tempo_inferred');
     });
@@ -850,6 +871,83 @@ describe('tempo', () => {
         expect(score.tempos).toEqual([]);
     });
 
+    it('bends a seeded rit. and restores a tempo when the shard printed no heading', () => {
+        const xml = wrap(bar(`${ATTRS_44}${words('rit.')}`) + bar(words('a tempo')) + bar());
+        const seed = { tempoBpm: 132, steadyBpm: 132, velocityByStaff: {} };
+        const seeded = parseMusicXmlString(xml, 0, seed);
+        const bpms = seeded.tempos.map((t) => t.bpm);
+        expect(Math.min(...bpms)).toBe(99); // 132 * 0.75
+        expect(seeded.tempos[seeded.tempos.length - 1]).toMatchObject({ tick: 1920, bpm: 132 });
+        for (let i = 1; i < bpms.length - 1; i++) {
+            expect(bpms[i]!).toBeLessThanOrEqual(bpms[i - 1]!);
+        }
+        expect(parseMusicXmlString(xml).tempos).toEqual([]);
+    });
+
+    it('applies a seeded staff velocity until a printed dynamic takes over', () => {
+        const dyn = (mark: string): string =>
+            `<direction><direction-type><dynamics><${mark}/></dynamics></direction-type></direction>`;
+        const xml = wrap(
+            `<measure>${ATTRS_44}${note('C', 4, 16)}</measure>` + `<measure>${dyn('f')}${note('D', 4, 16)}</measure>`,
+        );
+        const seeded = parseMusicXmlString(xml, 0, {
+            tempoBpm: null,
+            steadyBpm: null,
+            velocityByStaff: { 1: 0.34 },
+        });
+        expect(seeded.notes.find((n) => n.t === 0)?.v).toBe(0.34);
+        expect(seeded.notes.find((n) => n.t === 1920)?.v).toBe(0.82);
+    });
+
+    it('reports current, steady and velocity at a tick, including mid-ramp', () => {
+        const dyn = (mark: string): string =>
+            `<direction><direction-type><dynamics><${mark}/></dynamics></direction-type></direction>`;
+        const score = parseMusicXmlString(
+            wrap(bar(`${ATTRS_44}${soundTempo(132)}${dyn('pp')}`) + bar(words('rit.')) + bar(dyn('f')) + bar()),
+        );
+        const ramp = score.tempos.find((t) => t.src === 'ramp');
+        expect(ramp).toBeDefined();
+        const mid = expressionSeedAt(score, ramp!.tick);
+        expect(mid.steadyBpm).toBe(132);
+        expect(mid.tempoBpm).toBe(ramp!.bpm);
+        expect(mid.tempoBpm!).toBeLessThan(132);
+        expect(mid.tempoBpm!).toBeGreaterThan(99);
+        expect(mid.velocityByStaff[1]).toBe(0.34);
+
+        const afterForte = expressionSeedAt(score, 3840);
+        expect(afterForte.velocityByStaff[1]).toBe(0.82);
+        expect(afterForte.steadyBpm).toBe(132);
+    });
+
+    it('shades poco and molto rit., and treats meno mosso / ritenuto as steps', () => {
+        const poco = parseMusicXmlString(
+            wrap(bar(`${ATTRS_44}${soundTempo(120)}`) + bar(words('poco rit.')) + bar(words('a tempo')) + bar()),
+        );
+        expect(Math.min(...poco.tempos.map((t) => t.bpm))).toBe(102); // 120 * 0.85
+
+        const molto = parseMusicXmlString(
+            wrap(bar(`${ATTRS_44}${soundTempo(120)}`) + bar(words('molto rit.')) + bar(words('a tempo')) + bar()),
+        );
+        expect(Math.min(...molto.tempos.map((t) => t.bpm))).toBe(78); // 120 * 0.65
+
+        const meno = parseMusicXmlString(
+            wrap(bar(`${ATTRS_44}${soundTempo(120)}`) + bar(words('meno mosso')) + bar(words('a tempo')) + bar()),
+        );
+        expect(meno.tempos.find((t) => t.tick === 1920)).toEqual({ tick: 1920, bpm: 96 });
+        // a tempo restates 96, which is already in force, so no extra point —
+        // and it must not climb back to the original 120.
+        expect(meno.tempos.some((t) => t.tick > 0 && t.bpm === 120)).toBe(false);
+
+        const ritenuto = parseMusicXmlString(
+            wrap(bar(`${ATTRS_44}${soundTempo(120)}`) + bar(words('ritenuto')) + bar(words('a tempo')) + bar()),
+        );
+        expect(ritenuto.tempos).toEqual([
+            { tick: 0, bpm: 120, src: 'sound' },
+            { tick: 1920, bpm: 96, src: 'ramp' },
+            { tick: 3840, bpm: 120, src: 'ramp' },
+        ]);
+    });
+
     it('emits a fermata as a hold at the note it sits over, leaving the note alone', () => {
         const score = parseMusicXmlString(
             wrap(
@@ -868,6 +966,163 @@ describe('tempo', () => {
             ),
         );
         expect(score.holds).toHaveLength(1);
+    });
+
+    const bpmOf = (text: string): number | undefined =>
+        parseMusicXmlString(wrap(bar(`${ATTRS_44}${words(text)}`) + bar())).tempos[0]?.bpm;
+
+    it('knows vivacissimo, which used to be recognized and then yield nothing', () => {
+        expect(bpmOf('Vivacissimo')).toBe(168);
+    });
+
+    it('reads German and French headings, diacritics and all', () => {
+        expect(bpmOf('Langsam')).toBe(54);
+        expect(bpmOf('Lebhaft')).toBe(132);
+        expect(bpmOf('Mässig')).toBe(96);
+        // The spelling German editions actually print; ß survives NFD intact.
+        expect(bpmOf('Mäßig')).toBe(96);
+        expect(bpmOf('Modéré')).toBe(108);
+        expect(bpmOf('Animé')).toBe(120);
+    });
+
+    it('shades a term by the character word printed beside it', () => {
+        expect(bpmOf('Molto Adagio')!).toBeLessThan(66);
+        expect(bpmOf('Molto Allegro')!).toBeGreaterThan(132);
+        expect(bpmOf('Sehr langsam')!).toBeLessThan(54);
+        // A qualifier pulls toward the middle and must never shoot past it.
+        expect(bpmOf('Allegro non troppo')!).toBeLessThan(132);
+        expect(bpmOf('Allegro non troppo')!).toBeGreaterThan(108);
+    });
+
+    describe('meter-aware default', () => {
+        /** One exactly-full bar of num/den; `divisions=4`, so a unit is a 16th. */
+        const meterBar = (num: number, den: number, first: boolean): string =>
+            `<measure>` +
+            (first
+                ? `<attributes><divisions>4</divisions><time><beats>${num}</beats><beat-type>${den}</beat-type></time></attributes>`
+                : '') +
+            `<note><pitch><step>C</step><octave>4</octave></pitch><duration>${(num * 16) / den}</duration><voice>1</voice></note></measure>`;
+
+        const unmarked = (num: number, den: number) =>
+            parseMusicXmlString(wrap(meterBar(num, den, true) + meterBar(num, den, false)));
+
+        it('guesses an opening pulse from the meter when nothing prints a tempo', () => {
+            expect(unmarked(6, 8).defaultBpm).toBe(84);
+            expect(unmarked(9, 8).defaultBpm).toBe(84);
+            expect(unmarked(12, 8).defaultBpm).toBe(84);
+            expect(unmarked(3, 8).defaultBpm).toBe(96);
+            expect(unmarked(2, 2).defaultBpm).toBe(112);
+            expect(unmarked(3, 4).defaultBpm).toBe(108);
+            expect(unmarked(2, 4).defaultBpm).toBe(100);
+            expect(unmarked(4, 4).defaultBpm).toBe(96);
+        });
+
+        it('discloses the guess without inventing a tempo entry for it', () => {
+            const score = unmarked(4, 4);
+            expect(score.warnings).toContain('tempo_defaulted');
+            // A new tempos[].src value would be rejected wholesale by the strict
+            // enum in every deployed client, so the guess travels as defaultBpm.
+            expect(score.tempos).toEqual([]);
+        });
+
+        it('does not guess when the score prints a tempo of any kind', () => {
+            const printed = parseMusicXmlString(wrap(bar(`${ATTRS_44}${soundTempo(60)}`) + bar()));
+            expect(printed.warnings).not.toContain('tempo_defaulted');
+            expect(printed.defaultBpm).toBe(60);
+
+            const worded = parseMusicXmlString(wrap(bar(`${ATTRS_44}${words('Adagio')}`) + bar()));
+            expect(worded.warnings).not.toContain('tempo_defaulted');
+            expect(worded.defaultBpm).toBe(66);
+        });
+    });
+});
+
+describe('parseMxlFiles warning aggregation', () => {
+    /** Audiveris writes one .mxl per movement; no container.xml in these. */
+    const mxl = (xml: string): Buffer => {
+        const zip = new AdmZip();
+        zip.addFile('score.xml', Buffer.from(xml, 'utf8'));
+        return zip.toBuffer();
+    };
+    const soundTempo = (bpm: number): string =>
+        `<direction><direction-type><words>x</words></direction-type><sound tempo="${bpm}"/></direction>`;
+    const words = (text: string): string =>
+        `<direction><direction-type><words>${text}</words></direction-type></direction>`;
+    const bar = (lead = ''): string => `<measure>${lead}${note('C', 4, 16)}</measure>`;
+
+    const marked = mxl(wrap(bar(`${ATTRS_44}${soundTempo(132)}`) + bar()));
+    const unmarked = mxl(wrap(bar(ATTRS_44) + bar()));
+
+    it('does not report a defaulted tempo for a later movement whose guess is discarded', () => {
+        // Only the first movement's guess can survive as defaultBpm, so only the
+        // first movement's disclosure describes anything the reader will hear.
+        const score = parseMxlFiles([marked, unmarked]);
+        expect(score.defaultBpm).toBe(132);
+        expect(score.warnings).not.toContain('tempo_defaulted');
+        expect(score.warnings).toContain('multiple_movements_concatenated');
+    });
+
+    it('keeps the disclosure when the opening movement is the one that guessed', () => {
+        const score = parseMxlFiles([unmarked, marked]);
+        expect(score.defaultBpm).toBe(96);
+        expect(score.warnings).toContain('tempo_defaulted');
+        // The second movement's printed 132 still travels, at its own offset.
+        expect(score.tempos.map((t) => t.bpm)).toEqual([132]);
+    });
+
+    it('still unions every other warning a later movement raises', () => {
+        const short = mxl(wrap(`<measure>${ATTRS_44}${note('C', 4, 4)}</measure>` + bar()));
+        const score = parseMxlFiles([marked, short]);
+        expect(score.warnings).toContain('measure_underfull');
+        expect(score.warnings).not.toContain('tempo_defaulted');
+    });
+
+    it('gives a heading-less later movement its own meter default, not the previous rit. floor', () => {
+        const withContainer = (xml: string): Buffer => {
+            const zip = new AdmZip();
+            zip.addFile('score.xml', Buffer.from(xml, 'utf8'));
+            zip.addFile(
+                'META-INF/container.xml',
+                Buffer.from(
+                    '<?xml version="1.0"?><container><rootfiles><rootfile full-path="score.xml"/></rootfiles></container>',
+                    'utf8',
+                ),
+            );
+            return zip.toBuffer();
+        };
+        const movement1 = withContainer(wrap(bar(`${ATTRS_44}${words('Presto')}`) + bar(words('rit.'))));
+        const movement2 = withContainer(wrap(bar(ATTRS_44) + bar()));
+        const score = parseMxlFiles([movement1, movement2]);
+        const opening = score.tempos.find((t) => t.tick === 3840);
+        expect(opening).toEqual({ tick: 3840, bpm: 96 });
+        expect(opening?.src).toBeUndefined();
+        // Presto (172) ramped, but movement 2 must not sit at that floor.
+        expect(Math.min(...score.tempos.filter((t) => t.tick < 3840).map((t) => t.bpm))).toBe(129);
+    });
+});
+
+describe('shard seam seed', () => {
+    const words = (text: string): string =>
+        `<direction><direction-type><words>${text}</words></direction-type></direction>`;
+    const bar = (lead = ''): string => `<measure>${lead}${note('C', 4, 16)}</measure>`;
+
+    it('restores Allegro at a tempo on shard B when A ended in a rit.', () => {
+        const musicalA = parseMusicXmlString(
+            wrap(bar(`${ATTRS_44}${words('Allegro')}`) + bar() + bar() + bar(words('rit.'))),
+        );
+        const scoreA = buildScoreData(musicalA, null);
+        const aOverlapStartTick = musicalA.totalTicks;
+        const seed = expressionSeedAt(musicalA, aOverlapStartTick);
+        expect(seed.steadyBpm).toBe(132);
+        expect(seed.tempoBpm).toBe(99);
+
+        const musicalB = parseMusicXmlString(wrap(bar(`${ATTRS_44}${words('a tempo')}`) + bar() + bar()), 0, seed);
+        const scoreB = buildScoreData(musicalB, null);
+        const merged = mergeScoreDataParts([
+            { score: scoreA, sheets: { from: 1, to: 2 } },
+            { score: scoreB, sheets: { from: 3, to: 4 } },
+        ]);
+        expect(merged.tempos?.at(-1)?.bpm).toBe(132);
     });
 });
 
@@ -898,5 +1153,347 @@ describe('repeat structure', () => {
             `<measure number="1">${ATTRS_44}${note('C', 4, 16)}${bl('<ending number="2" type="discontinue"/>')}</measure>`,
         );
         expect(parseMusicXmlString(xml).repeats[0]).toMatchObject({ endingStop: true });
+    });
+});
+
+/**
+ * Jump structure: D.C., D.S., segno, coda, Fine. Three encodings reach the
+ * parser and all three have to work, because which one a file uses says more
+ * about the exporter than about the music.
+ */
+describe('jump structure', () => {
+    const words = (text: string): string =>
+        `<direction><direction-type><words>${text}</words></direction-type></direction>`;
+
+    const bar = (lead = '', tail = ''): string => `<measure>${lead}${note('C', 4, 16)}${tail}</measure>`;
+
+    const marksOf = (measures: string) => parseMusicXmlString(wrap(measures)).repeats;
+
+    it('reads the whole vocabulary from <sound> attributes on a direction', () => {
+        const marks = marksOf(
+            bar(`${ATTRS_44}<direction><sound segno="A"/></direction>`) +
+                bar('<direction><sound tocoda="C"/></direction>') +
+                bar('<direction><sound dalsegno="A"/></direction>') +
+                bar('<direction><sound coda="C"/></direction>') +
+                bar('<direction><sound fine="yes"/></direction>') +
+                bar('<direction><sound dacapo="yes"/></direction>'),
+        );
+        expect(marks[0]).toMatchObject({ segno: true });
+        expect(marks[1]).toMatchObject({ toCoda: true });
+        expect(marks[2]?.jump).toEqual({ kind: 'ds', al: null });
+        expect(marks[3]).toMatchObject({ codaTarget: true });
+        expect(marks[4]).toMatchObject({ fine: true });
+        expect(marks[5]?.jump).toEqual({ kind: 'dc', al: null });
+    });
+
+    it('reads <sound> attributes hung on a barline', () => {
+        const marks = marksOf(
+            bar(ATTRS_44) +
+                `<measure>${note('D', 4, 16)}<barline location="right"><sound tocoda="C"/></barline></measure>`,
+        );
+        expect(marks[1]).toMatchObject({ toCoda: true });
+    });
+
+    it('reads a <sound> hung straight on the measure — tempo and all', () => {
+        const score = parseMusicXmlString(
+            wrap(bar(ATTRS_44) + `<measure><sound tempo="88" dalsegno="A"/>${note('D', 4, 16)}</measure>`),
+        );
+        expect(score.tempos).toEqual([{ tick: 1920, bpm: 88, src: 'sound' }]);
+        expect(score.repeats[1]?.jump).toEqual({ kind: 'ds', al: null });
+    });
+
+    it('reads a segno glyph, and records a bare coda glyph as no more than a sighting', () => {
+        const marks = marksOf(
+            bar(`${ATTRS_44}<direction><direction-type><segno/></direction-type></direction>`) +
+                bar('<direction><direction-type><coda/></direction-type></direction>'),
+        );
+        expect(marks[0]).toMatchObject({ segno: true });
+        expect(marks[1]?.codaGlyph).toBe(true);
+        // The same sign is engraved at "To Coda" and over the coda itself; only
+        // position separates them, and that is the planner's call to make.
+        expect(marks[1]?.toCoda).toBeUndefined();
+        expect(marks[1]?.codaTarget).toBeUndefined();
+    });
+
+    it('reads jumps printed as words, with the target they name', () => {
+        const cases: Array<[string, { kind: string; al: string | null }]> = [
+            ['D.C. al Fine', { kind: 'dc', al: 'fine' }],
+            ['D.C.', { kind: 'dc', al: null }],
+            ['DC al Coda', { kind: 'dc', al: 'coda' }],
+            ['Da Capo al Fine', { kind: 'dc', al: 'fine' }],
+            ['D.S. al Coda', { kind: 'ds', al: 'coda' }],
+            ['D. S. alla Coda', { kind: 'ds', al: 'coda' }],
+            ['Dal Segno al Fine', { kind: 'ds', al: 'fine' }],
+        ];
+        for (const [text, expected] of cases) {
+            expect(marksOf(bar(`${ATTRS_44}${words(text)}`))[0]?.jump).toEqual(expected);
+        }
+    });
+
+    it('reads "To Coda", a bare "Fine" and a spelled-out "Coda"', () => {
+        expect(marksOf(bar(`${ATTRS_44}${words('To Coda')}`))[0]).toMatchObject({ toCoda: true });
+        expect(marksOf(bar(`${ATTRS_44}${words('Fine.')}`))[0]).toMatchObject({ fine: true });
+        expect(marksOf(bar(`${ATTRS_44}${words('Coda')}`))[0]).toMatchObject({ codaTarget: true });
+    });
+
+    it('does not let the "al Fine" inside a jump become a Fine of its own', () => {
+        // Tested in the wrong order this bar would end the piece instead of
+        // sending the player back to the top.
+        const marks = marksOf(bar(`${ATTRS_44}${words('D.C. al Fine')}`));
+        expect(marks[0]?.jump).toEqual({ kind: 'dc', al: 'fine' });
+        expect(marks[0]?.fine).toBeUndefined();
+    });
+
+    it('ignores prose that merely contains the structural words', () => {
+        for (const text of [
+            'Finegan',
+            'sempre alla fine',
+            'con fine espressione',
+            'dolce',
+            'diminuendo',
+            'Coda che segue',
+        ]) {
+            const mark = marksOf(bar(`${ATTRS_44}${words(text)}`))[0];
+            expect(mark?.jump ?? null).toBeNull();
+            expect(mark?.fine).toBeUndefined();
+            expect(mark?.toCoda).toBeUndefined();
+            expect(mark?.codaTarget).toBeUndefined();
+        }
+    });
+
+    it('scans every <words> in a direction, not just the first', () => {
+        const score = parseMusicXmlString(
+            wrap(
+                bar(
+                    `${ATTRS_44}<direction><direction-type><words>Andante</words></direction-type>` +
+                        `<direction-type><words>D.C. al Fine</words></direction-type></direction>`,
+                ),
+            ),
+        );
+        expect(score.tempos[0]).toMatchObject({ bpm: 84, src: 'word' });
+        expect(score.repeats[0]?.jump).toEqual({ kind: 'dc', al: 'fine' });
+    });
+
+    it('combines a jump encoded twice: <sound> for the kind, words for the target', () => {
+        const marks = marksOf(
+            bar(
+                `${ATTRS_44}<direction><direction-type><words>D.S. al Coda</words></direction-type>` +
+                    `<sound dalsegno="A"/></direction>`,
+            ),
+        );
+        expect(marks[0]?.jump).toEqual({ kind: 'ds', al: 'coda' });
+    });
+});
+
+describe('sustain pedal', () => {
+    const pedal = (type: string): string =>
+        `<direction><direction-type><pedal type="${type}" line="yes"/></direction-type></direction>`;
+
+    it('reads pedal marks as edges, a change being a re-catch on one tick', () => {
+        const xml = wrap(
+            `<measure number="1">${ATTRS_44}${pedal('start')}${note('C', 4, 8)}${pedal('change')}${note('E', 4, 8)}</measure>` +
+                `<measure number="2">${note('G', 4, 16)}${pedal('stop')}</measure>`,
+        );
+        expect(parseMusicXmlString(xml).pedals).toEqual([
+            { tick: 0, k: 'down' },
+            { tick: 960, k: 'up' },
+            { tick: 960, k: 'down' },
+            // Engraved after bar 2's last note, so it lands on the bar line and
+            // is pulled one tick back inside the bar it was written in.
+            { tick: 3839, k: 'up' },
+        ]);
+    });
+
+    it('keeps a release at the closing bar line inside the repeat it damps', () => {
+        // The pedal is taken on the downbeat and lifted at the double bar. Each
+        // pass has to get its own down and up: a release that drifted onto the
+        // next bar's tick belongs to whatever follows the repeat, and the two
+        // passes would ring together as one undamped wash.
+        const xml = wrap(
+            `<measure number="1">${ATTRS_44}<barline location="left"><repeat direction="forward"/></barline>` +
+                `${pedal('start')}${note('C', 4, 16)}</measure>` +
+                `<measure number="2">${note('E', 4, 16)}${pedal('stop')}` +
+                `<barline location="right"><repeat direction="backward"/></barline></measure>` +
+                `<measure number="3">${note('G', 4, 16)}</measure>`,
+        );
+        const score = buildScoreData(parseMusicXmlString(xml), null);
+        expect(score.warnings).toContain('repeats_unrolled');
+        expect(score.pedals).toEqual([
+            { tick: 0, k: 'down' },
+            { tick: 3839, k: 'up' },
+            { tick: 3840, k: 'down' },
+            { tick: 7679, k: 'up' },
+        ]);
+    });
+
+    it('keeps a bar-line re-catch and depression on the beat they name', () => {
+        // Only the release is pulled inside its bar. A change or a fresh start
+        // written at the bar line lands on the downbeat it belongs to: the
+        // engine reads a damper drop on the exact tick a note ends as the
+        // pedal falling with the key, and an edge one tick early would catch
+        // the very note the change exists to clear.
+        const xml = wrap(
+            `<measure number="1">${ATTRS_44}${pedal('start')}${note('C', 4, 16)}${pedal('change')}</measure>` +
+                `<measure number="2">${note('E', 4, 16)}${pedal('stop')}</measure>`,
+        );
+        expect(parseMusicXmlString(xml).pedals).toEqual([
+            { tick: 0, k: 'down' },
+            { tick: 1920, k: 'up' },
+            { tick: 1920, k: 'down' },
+            { tick: 3839, k: 'up' },
+        ]);
+    });
+
+    it('ignores pedal types there is nothing to do about', () => {
+        const xml = wrap(`<measure number="1">${ATTRS_44}${pedal('continue')}${note('C', 4, 16)}</measure>`);
+        expect(parseMusicXmlString(xml).pedals).toEqual([]);
+    });
+
+    it('offsets pedal edges along with the rest of a concatenated movement', () => {
+        const xml = wrap(`<measure number="1">${ATTRS_44}${pedal('start')}${note('C', 4, 16)}</measure>`);
+        expect(parseMusicXmlString(xml, 10000).pedals).toEqual([{ tick: 10000, k: 'down' }]);
+    });
+});
+
+/** Ornaments, grace figures, and swing — baked into the note list at parse/build. */
+describe('ornaments, graces and swing', () => {
+    const orns = (tag: string, accidental = ''): string =>
+        `<notations><ornaments><${tag}/>${accidental}</ornaments><articulations><tenuto/></articulations></notations>`;
+
+    const soundTempo = (bpm: number): string =>
+        `<direction><direction-type><words>x</words></direction-type><sound tempo="${bpm}"/></direction>`;
+
+    const words = (text: string): string =>
+        `<direction><direction-type><words>${text}</words></direction-type></direction>`;
+
+    it('realises a trill-mark on a half note as 32nds ending on the principal', () => {
+        const xml = wrap(`<measure number="1">${ATTRS_44}${note('C', 4, 8, orns('trill-mark'))}</measure>`);
+        const score = parseMusicXmlString(xml);
+        const notes = score.notes;
+        expect(notes.length).toBeGreaterThan(1);
+        expect(notes[0]?.p).toBe(60);
+        expect(notes[1]?.p).toBe(62);
+        expect(notes[notes.length - 1]?.p).toBe(60);
+        expect(notes.slice(0, -1).every((n) => n.d === 60)).toBe(true);
+        expect(notes.reduce((sum, n) => sum + n.d, 0)).toBe(960);
+        expect(score.warnings).toContain('ornaments_realized');
+    });
+
+    it('realises a mordent as principal–lower–principal', () => {
+        const xml = wrap(
+            `<measure number="1">${ATTRS_44}${note('C', 4, 4, orns('mordent'))}${note('E', 4, 12)}</measure>`,
+        );
+        const notes = parseMusicXmlString(xml).notes.filter((n) => n.t < 480);
+        expect(notes.map((n) => n.p)).toEqual([60, 59, 60]);
+        expect(notes.map((n) => n.d)).toEqual([60, 60, 360]);
+    });
+
+    it('rolls an arpeggiated chord from the bottom', () => {
+        const xml = wrap(
+            `<measure number="1">${ATTRS_44}
+                <note><pitch><step>C</step><octave>4</octave></pitch><duration>4</duration><voice>1</voice>
+                    <notations><arpeggiate direction="up"/><articulations><tenuto/></articulations></notations></note>
+                <note><chord/><pitch><step>E</step><octave>4</octave></pitch><duration>4</duration><voice>1</voice>
+                    <notations><articulations><tenuto/></articulations></notations></note>
+                <note><chord/><pitch><step>G</step><octave>4</octave></pitch><duration>4</duration><voice>1</voice>
+                    <notations><articulations><tenuto/></articulations></notations></note>
+                ${note('C', 5, 12)}
+            </measure>`,
+        );
+        const chord = parseMusicXmlString(xml).notes.filter((n) => n.t < 480);
+        expect(chord.map((n) => n.p)).toEqual([60, 64, 67]);
+        expect(chord.map((n) => n.t)).toEqual([0, 60, 120]);
+        expect(chord.every((n) => n.t + n.d === 480)).toBe(true);
+        expect(parseMusicXmlString(xml).warnings).toContain('ornaments_realized');
+    });
+
+    it('gives an appoggiatura half the principal on the beat', () => {
+        const xml = wrap(
+            `<measure number="1">${ATTRS_44}
+                <note><grace slash="no"/><pitch><step>D</step><octave>4</octave></pitch><voice>1</voice></note>
+                ${note('E', 4, 4)}
+                <note><rest/><duration>12</duration><voice>1</voice></note>
+            </measure>`,
+        );
+        const score = parseMusicXmlString(xml);
+        expect(score.notes).toEqual([
+            { t: 0, d: 240, p: 62, h: 0, v: 0.6 },
+            { t: 240, d: plain(240), p: 64, h: 0 },
+        ]);
+    });
+
+    it('sizes an acciaccatura to 77 ticks at 120 bpm and 38 at 60 bpm', () => {
+        const at = (bpm: number) =>
+            wrap(
+                `<measure number="1">${ATTRS_44}${soundTempo(bpm)}
+                    <note><rest/><duration>4</duration><voice>1</voice></note>
+                    <note><grace/><pitch><step>D</step><octave>4</octave></pitch><voice>1</voice></note>
+                    ${note('E', 4, 4)}
+                    <note><rest/><duration>8</duration><voice>1</voice></note>
+                </measure>`,
+            );
+        const fast = parseMusicXmlString(at(120)).notes[0];
+        expect(fast).toMatchObject({ t: 403, d: 77, p: 62 });
+        const slow = parseMusicXmlString(at(60)).notes[0];
+        expect(slow).toMatchObject({ t: 442, d: 38, p: 62 });
+    });
+
+    it('swings a pair of eighths from a heading and warns', () => {
+        const xml = wrap(
+            `<measure number="1">${ATTRS_44}${words('Swing')}${note('C', 4, 2)}${note('D', 4, 2)}${note('E', 4, 12)}</measure>`,
+        );
+        const parsed = parseMusicXmlString(xml);
+        expect(parsed.swing).toBe(true);
+        const score = buildScoreData(parsed, null);
+        expect(score.warnings).toContain('swing_applied');
+        const pair = score.notes.filter((n) => n.p === 60 || n.p === 62);
+        expect(pair.find((n) => n.p === 60)).toMatchObject({ t: 0, d: plain(240) + 80 });
+        expect(pair.find((n) => n.p === 62)).toMatchObject({ t: 320, d: plain(240) - 80 });
+    });
+});
+
+/**
+ * The two copies of the ScoreData contract are kept in lockstep by hand, so the
+ * only thing that catches drift is a payload walked through both of them.
+ */
+describe('ScoreData v4 contract', () => {
+    const v4 = {
+        version: 4,
+        ticksPerQuarter: TICKS_PER_QUARTER,
+        defaultBpm: 96,
+        timeSignatures: [{ tick: 0, num: 4, den: 4 }],
+        tempos: [{ tick: 0, bpm: 96, src: 'sound' as const }],
+        holds: [],
+        pedals: [
+            { tick: 0, k: 'down' as const },
+            { tick: 960, k: 'up' as const },
+            { tick: 960, k: 'down' as const },
+        ],
+        totalTicks: 1920,
+        notes: [{ t: 0, d: 480, p: 60, h: 0 as const }],
+        measures: [{ n: 1, tick: 0, dTicks: 1920, page: 0, sys: 0, x0: 0, x1: 1, srcIndex: 0 }],
+        systems: [{ page: 0, y0: 0, y1: 1 }],
+        warnings: ['tempo_defaulted'],
+    };
+
+    it('writes and validates version 4, pedals and all', () => {
+        expect(SCORE_DATA_VERSION).toBe(4);
+        const checked = scoreDataSchema.safeParse(v4);
+        expect(checked.success).toBe(true);
+        expect(checked.data?.pedals).toEqual(v4.pedals);
+    });
+
+    it('refuses a pedal edge it could not act on', () => {
+        expect(scoreDataSchema.safeParse({ ...v4, pedals: [{ tick: 0, k: 'half' }] }).success).toBe(false);
+    });
+
+    it('holds the client copy to the same version and the same field', () => {
+        // Read as text rather than imported: the app tree sits outside this
+        // package's rootDir, and importing it would drag the whole client into
+        // the service's typecheck. A string match is enough for what this
+        // guards — one copy of the contract moving without the other.
+        const client = readFileSync(new URL('../../../src/types/scoreData.ts', import.meta.url), 'utf8');
+        expect(client).toContain(`export const SCORE_DATA_VERSION = ${SCORE_DATA_VERSION};`);
+        expect(client).toContain('pedals: z.array(scorePedalSchema).max(256).optional(),');
     });
 });

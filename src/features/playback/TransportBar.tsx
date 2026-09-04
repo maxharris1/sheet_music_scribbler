@@ -6,7 +6,7 @@ import { analysisIsStale } from '@/features/playback/scoreAnalysisService';
 import type { ScoreAnalysisState } from '@/features/playback/useScoreAnalysis';
 import { BPM_MAX, BPM_MIN, useViewerStore } from '@/state/store';
 import type { MemberRole } from '@/types/database';
-import { hasLeftHand, tempoIsInferred } from '@/types/scoreData';
+import { hasLeftHand } from '@/types/scoreData';
 import type { ScoreData } from '@/types/scoreData';
 import {
     ChevronDownIcon,
@@ -75,8 +75,16 @@ const SCORE_WARNING_COPY: Array<{ code: string; text: string }> = [
         text: 'Repeats are played straight through once. First and second endings will both be played, in order.',
     },
     {
+        code: 'jumps_ignored',
+        text: 'A D.C., D.S. or Coda mark could not be followed reliably, so the score plays straight through in page order.',
+    },
+    {
         code: 'repeats_unrolled',
         text: 'Repeats and endings are played as written, so bar numbers go back on each repeat.',
+    },
+    {
+        code: 'jumps_performed',
+        text: 'D.C., D.S. and Coda marks are played as written, so the playhead jumps back and the bar count revisits earlier bars.',
     },
     {
         code: 'meter_corrected',
@@ -95,6 +103,14 @@ const SCORE_WARNING_COPY: Array<{ code: string; text: string }> = [
         text: 'Some bars came out short and were padded, so notes there may fall early.',
     },
     {
+        code: 'tempo_defaulted',
+        text: 'No tempo is printed at all — a starting tempo was chosen from the time signature. Adjust it to taste.',
+    },
+    {
+        code: 'tempo_inferred',
+        text: 'No metronome mark is printed — the starting tempo was estimated from the tempo word. Adjust it to taste.',
+    },
+    {
         code: 'multiple_movements_concatenated',
         text: 'The pieces in this file play back to back as one, so bar numbers restart partway through.',
     },
@@ -108,6 +124,14 @@ const SCORE_WARNING_COPY: Array<{ code: string; text: string }> = [
         text: 'Dynamics could not be told apart between the hands, so both play at the same volume.',
     },
     { code: 'grace_notes_skipped', text: 'Some grace notes had nothing to attach to and were left out.' },
+    {
+        code: 'ornaments_realized',
+        text: 'Trills, mordents, turns and arpeggio signs are played out as written, at the tempo in force.',
+    },
+    {
+        code: 'swing_applied',
+        text: 'The heading says swing, so pairs of eighth notes are played long–short.',
+    },
     { code: 'no_geometry', text: 'The page positions could not be read, so there is no moving playhead.' },
     {
         code: 'measure_geometry_mismatch',
@@ -125,13 +149,12 @@ const StaleAnalysisNotice = (props: { engineVersion: string | null; canManage: b
         return null;
     }
     return (
-        <div className="rounded-lg border border-amber-300/70 bg-amber-50/80 px-3 py-1.5 text-xs text-amber-900" role="status">
+        <div
+            className="rounded-lg border border-amber-300/70 bg-amber-50/80 px-3 py-1.5 text-xs text-amber-900"
+            role="status"
+        >
             This play-along was made by an older version of the analysis.{' '}
-            <button
-                type="button"
-                onClick={props.onGenerate}
-                className="font-medium underline underline-offset-2"
-            >
+            <button type="button" onClick={props.onGenerate} className="font-medium underline underline-offset-2">
                 Regenerate it
             </button>{' '}
             to pick up the improvements.
@@ -155,7 +178,9 @@ const ScoreWarnings = (props: { warnings: readonly string[] }) => {
                 className="flex w-full items-center gap-1.5 text-left text-xs font-medium text-amber-900"
             >
                 {open ? <ChevronDownIcon size={13} /> : <ChevronUpIcon size={13} />}
-                {present.length === 1 ? '1 thing to know about this play-along' : `${present.length} things to know about this play-along`}
+                {present.length === 1
+                    ? '1 thing to know about this play-along'
+                    : `${present.length} things to know about this play-along`}
             </button>
             {open ? (
                 <ul className="mt-1.5 flex list-disc flex-col gap-1 pl-4 text-xs text-amber-900">
@@ -250,7 +275,6 @@ const ReadyTransport = (props: TransportBarProps & { score: ScoreData }) => {
     const running = playbackStatus === 'playing' || playbackStatus === 'counting';
     const loading = playbackStatus === 'loading';
     const lhAvailable = hasLeftHand(score);
-    const lastMeasure = score.measures[score.measures.length - 1];
     const lastIndex = score.measures.length - 1;
 
     const play = () => {
@@ -320,6 +344,10 @@ const ReadyTransport = (props: TransportBarProps & { score: ScoreData }) => {
             return nth;
         });
     }, [score]);
+    // How long the score is on the page, which is not where the playthrough
+    // ends: a D.C. al Fine stops on the Fine bar, so the last performed entry
+    // carries a smaller number than bars already visited ("m. 21 / 12").
+    const printedLast = useMemo(() => score.measures.reduce((max, m) => Math.max(max, m.n), 0), [score]);
     const repeatedPrinted = useMemo(() => {
         const counts = new Map<number, number>();
         score.measures.forEach((m, i) => {
@@ -445,7 +473,7 @@ const ReadyTransport = (props: TransportBarProps & { score: ScoreData }) => {
                         <ChevronLeftIcon size={16} />
                     </button>
                     <span className="min-w-[4.5rem] text-center text-sm tabular-nums text-stone-700 sm:min-w-[5.5rem]">
-                        m. {measureLabel(currentMeasureIndex)} / {lastMeasure ? lastMeasure.n : '–'}
+                        m. {measureLabel(currentMeasureIndex)} / {score.measures.length > 0 ? printedLast : '–'}
                     </span>
                     <button
                         type="button"
@@ -478,7 +506,12 @@ const ReadyTransport = (props: TransportBarProps & { score: ScoreData }) => {
 
                 {/* Practice controls — collapsible on phones */}
                 <div className={`${expanded ? 'flex' : 'hidden'} flex-wrap items-center gap-x-2 gap-y-1 sm:flex`}>
-                    <TempoControl bpm={bpm} onBpm={setBpm} compound={isCompoundMeter(score)} inferred={tempoIsInferred(score)} />
+                    <TempoControl
+                        bpm={bpm}
+                        onBpm={setBpm}
+                        compound={isCompoundMeter(score)}
+                        estimate={tempoEstimate(score)}
+                    />
 
                     <div className="mx-0.5 hidden h-6 w-px bg-stone-200 sm:block" />
 
@@ -593,6 +626,25 @@ const LoopEdge = ({
 );
 
 /**
+ * Where a guessed opening tempo came from. Reading a number off an Italian word
+ * and picking one out of the meter are different admissions — the second score
+ * prints no tempo at all — so they get different words rather than one blanket
+ * "estimated".
+ */
+type TempoEstimate = 'word' | 'meter';
+
+const TEMPO_ESTIMATE_COPY: Record<TempoEstimate, { control: string; badge: string }> = {
+    word: {
+        control: 'Tempo (quarter note BPM) — estimated from the tempo marking, which prints no number',
+        badge: 'Estimated from the printed tempo marking, which gives no number',
+    },
+    meter: {
+        control: 'Tempo (quarter note BPM) — no tempo is printed, so this one was chosen from the time signature',
+        badge: 'No tempo is printed at all — this one was chosen from the time signature',
+    },
+};
+
+/**
  * Tempo to the nearest BPM: −/+ step by one, and the number itself is typable
  * for a big jump. The draft state lets "1…0…5" exist mid-keystroke without the
  * clamp snapping it to 40 on the way.
@@ -601,12 +653,12 @@ const TempoControl = ({
     bpm,
     onBpm,
     compound,
-    inferred,
+    estimate,
 }: {
     bpm: number;
     onBpm: (bpm: number) => void;
     compound: boolean;
-    inferred: boolean;
+    estimate: TempoEstimate | null;
 }) => {
     const [draft, setDraft] = useState<string | null>(null);
 
@@ -621,11 +673,7 @@ const TempoControl = ({
     return (
         <div
             className="flex items-center gap-0.5"
-            title={
-                inferred
-                    ? 'Tempo (quarter note BPM) — estimated from the tempo marking, which prints no number'
-                    : 'Tempo (quarter note BPM)'
-            }
+            title={estimate ? TEMPO_ESTIMATE_COPY[estimate].control : 'Tempo (quarter note BPM)'}
         >
             <span className="text-sm text-stone-500">♩=</span>
             <button type="button" aria-label="Slower" onClick={() => onBpm(bpm - 1)} className={squareButton(false)}>
@@ -659,11 +707,8 @@ const TempoControl = ({
                 +
             </button>
             {compound ? <span className="ml-0.5 text-xs text-stone-400">(♩· = {Math.round(bpm / 1.5)})</span> : null}
-            {inferred ? (
-                <span
-                    className="ml-0.5 text-xs text-stone-400"
-                    title="Estimated from the printed tempo marking, which gives no number"
-                >
+            {estimate ? (
+                <span className="ml-0.5 text-xs text-stone-400" title={TEMPO_ESTIMATE_COPY[estimate].badge}>
                     est.
                 </span>
             ) : null}
@@ -713,6 +758,42 @@ const HandControl = ({
         />
     </div>
 );
+
+/**
+ * True when the opening tempo was guessed rather than printed. A WORD only
+ * counts at tick 0 — `tempoIsInferred` in the schema module treats any WORD as
+ * an estimate, which is why this lives here: that file is watched by the
+ * engine-version guard, and this badge change does not change what a PDF turns
+ * into.
+ */
+const openingTempoIsInferred = (score: ScoreData): boolean => {
+    const opening = score.tempos?.[0];
+    return (
+        (opening?.src === 'word' && opening.tick === 0) ||
+        ((opening?.tick ?? Number.POSITIVE_INFINITY) > 0 &&
+            (score.warnings.includes('tempo_inferred') || score.warnings.includes('tempo_defaulted')))
+    );
+};
+
+/**
+ * Which admission the guessed tempo warrants. A tempo word at the opening
+ * beats the meter as an explanation; a WORD further in does not, because the
+ * meter is what filled the unmarked start. The meter is only ever the last
+ * resort for a score that marks nothing at tick 0.
+ */
+const tempoEstimate = (score: ScoreData): TempoEstimate | null => {
+    if (!openingTempoIsInferred(score)) {
+        return null;
+    }
+    const opening = score.tempos?.[0];
+    const openingWord = opening?.src === 'word' && opening.tick === 0;
+    // A later WORD must not outrank a meter-defaulted opening: the first page
+    // printed no tempo at all, and that is what the badge should admit.
+    if (score.warnings.includes('tempo_defaulted') && !openingWord) {
+        return 'meter';
+    }
+    return 'word';
+};
 
 /** 6/8, 9/8, 12/8… — musicians read those tempos in dotted-quarter beats. */
 const isCompoundMeter = (score: ScoreData): boolean => {

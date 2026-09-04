@@ -21,14 +21,17 @@ import {
     type OmJobRow,
 } from './jobStore.js';
 import { mergeScoreDataParts, seamIsUnsafe, splitSheetRangesOverlapping } from './mergeScoreData.js';
-import { parseMxlFiles } from './musicxml.js';
-import { parseOmrGeometry } from './omrGeometry.js';
+import { expressionSeedAt, parseMxlFiles, type MusicalScore, type ParseSeed } from './musicxml.js';
+import { parseOmrGeometry, type OmrGeometry } from './omrGeometry.js';
+import { summarizeStructure, type StructureSummary } from './repeats.js';
 import { emptyTimings, type JobTimings } from './timings.js';
 import type { Writeback } from './writeback.js';
 import type { ScoreData } from './scoreData.js';
 
 /**
- * Bump svc-<n> when musicxml/omrGeometry/buildScoreData/scoreData/flags/tessdata change.
+ * Bump svc-<n> when anything that changes the ScoreData a given PDF produces
+ * changes: musicxml/omrGeometry/buildScoreData/repeats/mergeScoreData/caps/
+ * scoreData/flags/tessdata. `scripts/check-engine-version.mjs` enforces it.
  *
  * Jumped 2 → 5 deliberately. Analyses in production report `svc-4`, a value that
  * has never existed in this repository's history — the deployed service was built
@@ -36,8 +39,12 @@ import type { ScoreData } from './scoreData.js';
  * what is actually deployed, which matters because staleness is judged by
  * comparing that integer: naming this svc-3 would make every production-analyzed
  * document look NEWER than the current engine and never offer to regenerate.
+ *
+ * svc-8 seeds the second shard of a split score with the first's tempo and
+ * dynamics, so rit./a tempo/hairpins survive the page cut instead of resetting.
+ * svc-9: ornaments, appoggiatura, tempo-relative graces, swing.
  */
-export const ENGINE_VERSION = 'audiveris-5.6.1+svc-6';
+export const ENGINE_VERSION = 'audiveris-5.6.1+svc-9';
 
 const MAX_PDF_BYTES = 60 * 1024 * 1024;
 export const MAX_PAGES = 60;
@@ -196,13 +203,19 @@ const runPipeline = async (adapters: PipelineAdapters): Promise<boolean> => {
             return false;
         }
 
-        const score = await transcribe(pdfPath, workDir, timings, (sheet) => {
-            const now = Date.now();
-            if (now - lastBeat >= HEARTBEAT_MIN_INTERVAL_MS) {
-                lastBeat = now;
-                void adapters.onProcessing(sheet).catch(() => undefined);
-            }
-        }, adapters.registerKill);
+        const score = await transcribe(
+            pdfPath,
+            workDir,
+            timings,
+            (sheet) => {
+                const now = Date.now();
+                if (now - lastBeat >= HEARTBEAT_MIN_INTERVAL_MS) {
+                    lastBeat = now;
+                    void adapters.onProcessing(sheet).catch(() => undefined);
+                }
+            },
+            adapters.registerKill,
+        );
 
         if (adapters.isAbandoned?.()) {
             return false;
@@ -275,11 +288,7 @@ const transcribeParallel = async (
     onSheet: (sheet: number) => void,
     registerKill?: (kill: KillJvm) => void,
 ): Promise<ScoreData> => {
-    const ranges = splitSheetRangesOverlapping(
-        timings.pageCount ?? 0,
-        PARALLEL_SHEET_SHARDS,
-        PARALLEL_SHEET_OVERLAP,
-    );
+    const ranges = splitSheetRangesOverlapping(timings.pageCount ?? 0, PARALLEL_SHEET_SHARDS, PARALLEL_SHEET_OVERLAP);
     const kills: KillJvm[] = [];
     registerKill?.(() => {
         for (const kill of kills) {
@@ -293,10 +302,10 @@ const transcribeParallel = async (
     };
 
     const started = Date.now();
-    const parts = await Promise.all(
+    const artifacts = await Promise.all(
         ranges.map(async (sheets, index) => {
             const outDir = join(workDir, `out-${sheets.from}-${sheets.to}`);
-            const { score, openTiesAtEnd } = await transcribeRangeDetailed(
+            const collected = await collectRangeArtifacts(
                 pdfPath,
                 outDir,
                 timings,
@@ -310,9 +319,35 @@ const transcribeParallel = async (
                 sheets,
                 /* aggregateTimings */ index === 0,
             );
-            return { score, sheets, openTiesAtEnd };
+            return { ...collected, sheets };
         }),
     );
+
+    const tParse = Date.now();
+    const first = artifacts[0];
+    const second = artifacts[1];
+    if (!first || !second) {
+        throw new JobError(ERROR_CODES.internal, 'parallel transcribe: expected two shards');
+    }
+    const parsedA = parseRangeArtifacts(first.mxlBuffers, first.geometry);
+    const seed = expressionSeedAt(parsedA.musical, overlapPageStartTick(parsedA.score, parsedA.musical));
+    const parsedB = parseRangeArtifacts(second.mxlBuffers, second.geometry, seed);
+    timings.parseMs = (timings.parseMs ?? 0) + (Date.now() - tParse);
+
+    const parts = [
+        {
+            score: parsedA.score,
+            sheets: first.sheets,
+            openTiesAtEnd: parsedA.openTiesAtEnd,
+            structure: parsedA.structure,
+        },
+        {
+            score: parsedB.score,
+            sheets: second.sheets,
+            openTiesAtEnd: parsedB.openTiesAtEnd,
+            structure: parsedB.structure,
+        },
+    ];
 
     const safety = seamIsUnsafe(parts);
     if (safety.unsafe) {
@@ -356,7 +391,38 @@ const transcribeRangeDetailed = async (
     registerKill: ((kill: KillJvm) => void) | undefined,
     sheets: { from: number; to: number } | undefined,
     aggregateTimings = true,
-): Promise<{ score: ScoreData; openTiesAtEnd: number }> => {
+): Promise<{ score: ScoreData; openTiesAtEnd: number; structure: StructureSummary }> => {
+    const artifacts = await collectRangeArtifacts(
+        pdfPath,
+        outDir,
+        timings,
+        onSheet,
+        registerKill,
+        sheets,
+        aggregateTimings,
+    );
+    const tParse = Date.now();
+    const parsed = parseRangeArtifacts(artifacts.mxlBuffers, artifacts.geometry);
+    if (aggregateTimings) {
+        timings.parseMs = Date.now() - tParse;
+    } else {
+        timings.parseMs = (timings.parseMs ?? 0) + (Date.now() - tParse);
+    }
+    // Summarized from the marks rather than the built score: buildScoreData has
+    // already decided what this range alone can perform, and the merge needs to
+    // know what reaches past it.
+    return { score: parsed.score, openTiesAtEnd: parsed.openTiesAtEnd, structure: parsed.structure };
+};
+
+const collectRangeArtifacts = async (
+    pdfPath: string,
+    outDir: string,
+    timings: JobTimings,
+    onSheet: (sheet: number) => void,
+    registerKill: ((kill: KillJvm) => void) | undefined,
+    sheets: { from: number; to: number } | undefined,
+    aggregateTimings: boolean,
+): Promise<{ mxlBuffers: Buffer[]; geometry: OmrGeometry | null }> => {
     await mkdir(outDir, { recursive: true });
     const result = await runAudiveris(pdfPath, outDir, {
         timeoutMs: timeoutForPages(timings.pageCount ?? null),
@@ -376,17 +442,39 @@ const transcribeRangeDetailed = async (
         throw new JobError(ERROR_CODES.noStavesFound, 'Audiveris produced no MusicXML');
     }
 
-    const tParse = Date.now();
     const mxlBuffers = await Promise.all(result.mxlPaths.map((path) => readFile(path)));
-    const musical = parseMxlFiles(mxlBuffers);
     const geometry = result.omrPath ? parseOmrGeometry(await readFile(result.omrPath)) : null;
+    return { mxlBuffers, geometry };
+};
+
+const parseRangeArtifacts = (
+    mxlBuffers: Buffer[],
+    geometry: OmrGeometry | null,
+    seed?: ParseSeed,
+): { score: ScoreData; musical: MusicalScore; openTiesAtEnd: number; structure: StructureSummary } => {
+    const musical = parseMxlFiles(mxlBuffers, seed);
     const score = buildScoreData(musical, geometry);
-    if (aggregateTimings) {
-        timings.parseMs = Date.now() - tParse;
-    } else {
-        timings.parseMs = (timings.parseMs ?? 0) + (Date.now() - tParse);
+    return {
+        score,
+        musical,
+        openTiesAtEnd: musical.openTiesAtEnd,
+        structure: summarizeStructure(musical.repeats),
+    };
+};
+
+/** Tick where shard A's last (overlap) page begins, on the linear musical timeline. */
+const overlapPageStartTick = (score: ScoreData, musical: MusicalScore): number => {
+    const pages = score.measures.map((m) => m.page).filter((p) => p >= 0);
+    if (pages.length === 0) {
+        return musical.totalTicks;
     }
-    return { score, openTiesAtEnd: musical.openTiesAtEnd };
+    const maxPage = Math.max(...pages);
+    const first = score.measures.find((m) => m.page === maxPage);
+    if (!first) {
+        return musical.totalTicks;
+    }
+    const idx = first.srcIndex ?? score.measures.indexOf(first);
+    return musical.measures[idx]?.tick ?? first.tick;
 };
 
 const downloadPdf = async (url: string, destination: string): Promise<void> => {

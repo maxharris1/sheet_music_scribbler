@@ -8,7 +8,7 @@ import { z } from 'zod';
  * to the rendered PDF. v2 also carries per-staff bands, key signatures, and
  * clefs so the fingering populator can synthesize notehead bboxes. v3 adds a
  * tempo map and fermata holds, so playback can follow the score's own tempo
- * instead of one number for the whole piece.
+ * instead of one number for the whole piece. v4 adds sustain-pedal edges.
  *
  * All geometry is normalized 0–1 against its page (the same contract as
  * annotations), so it is zoom/DPI/rotation invariant.
@@ -16,8 +16,8 @@ import { z } from 'zod';
  * KEEP IN LOCKSTEP with services/omr-service/src/scoreData.ts.
  */
 
-/** Current writer version. Readers accept 1 through 3 (see parseScoreData). */
-export const SCORE_DATA_VERSION = 3;
+/** Current writer version. Readers accept 1 through 4 (see parseScoreData). */
+export const SCORE_DATA_VERSION = 4;
 /** Oldest ScoreData version the client still serves from cache. */
 export const SCORE_DATA_MIN_VERSION = 1;
 
@@ -144,6 +144,19 @@ const scoreHoldSchema = z.object({
     beats: z.number().positive().max(16),
 });
 
+/**
+ * One sustain-pedal edge. Edges rather than spans: OMR routinely loses one end
+ * of a pedal line, and a missing edge costs a single note's ring instead of
+ * invalidating a whole span. A re-catch (MusicXML `change`) is two edges on the
+ * same tick, 'up' before 'down' — order carries the meaning, so anything
+ * re-sorting this array must sort stably. v4+.
+ */
+const scorePedalSchema = z.object({
+    tick: z.number().int().nonnegative(),
+    /** 'down' takes the pedal, 'up' releases it. */
+    k: z.enum(['down', 'up']),
+});
+
 export const scoreDataSchema = z.object({
     version: z.number().int(),
     ticksPerQuarter: z.literal(TICKS_PER_QUARTER),
@@ -157,6 +170,8 @@ export const scoreDataSchema = z.object({
     tempos: z.array(scoreTempoSchema).max(512).optional(),
     /** v3+; fermata holds. */
     holds: z.array(scoreHoldSchema).max(128).optional(),
+    /** v4+; sustain-pedal edges in tick order. */
+    pedals: z.array(scorePedalSchema).max(256).optional(),
     totalTicks: z.number().int().positive(),
     notes: z.array(scoreNoteSchema).max(50_000),
     measures: z.array(scoreMeasureSchema).max(2_000),
@@ -173,6 +188,7 @@ export type ScoreKeySig = z.infer<typeof scoreKeySigSchema>;
 export type ScoreClef = z.infer<typeof scoreClefSchema>;
 export type ScoreTempo = z.infer<typeof scoreTempoSchema>;
 export type ScoreHold = z.infer<typeof scoreHoldSchema>;
+export type ScorePedal = z.infer<typeof scorePedalSchema>;
 export type ScoreData = z.infer<typeof scoreDataSchema>;
 
 /**
@@ -203,6 +219,9 @@ export const parseScoreData = (raw: unknown): ScoreData | null => {
         clefs: parsed.data.clefs ? [...parsed.data.clefs].sort((a, b) => a.tick - b.tick) : undefined,
         tempos: parsed.data.tempos ? [...parsed.data.tempos].sort((a, b) => a.tick - b.tick) : undefined,
         holds: parsed.data.holds ? [...parsed.data.holds].sort((a, b) => a.tick - b.tick) : undefined,
+        // Sorting by tick alone is enough because Array#sort is stable: a
+        // re-catch writes 'up' then 'down' on one tick and must stay that way.
+        pedals: parsed.data.pedals ? [...parsed.data.pedals].sort((a, b) => a.tick - b.tick) : undefined,
     };
 };
 
@@ -255,5 +274,22 @@ export const tempoAt = (score: ScoreData, tick: number, fallback: number): numbe
     return bpm;
 };
 
-/** True when the opening tempo was guessed from a word rather than printed. */
-export const tempoIsInferred = (score: ScoreData): boolean => score.tempos?.[0]?.src === 'word';
+/**
+ * True when the opening tempo was guessed rather than printed.
+ *
+ * The warnings are consulted as well as the map, because two real cases have no
+ * `tempos[0]` to look at: a shard-merged score whose map was dropped, and a
+ * tempo derived from the meter alone, which is deliberately carried as
+ * `defaultBpm` + a warning rather than as a tempo entry with a new `src`.
+ *
+ * They only get a say when no tempo entry sits at tick 0, though: a metronome
+ * mark at the top of page 1 must not read as a guess because some later,
+ * unmarked stretch of the score carried a warning. The converse is a score
+ * whose first printed tempo arrives pages in — its opening really is the
+ * guessed `defaultBpm`, and the map having entries further along must not
+ * hide that.
+ */
+export const tempoIsInferred = (score: ScoreData): boolean =>
+    score.tempos?.[0]?.src === 'word' ||
+    ((score.tempos?.[0]?.tick ?? Number.POSITIVE_INFINITY) > 0 &&
+        (score.warnings.includes('tempo_inferred') || score.warnings.includes('tempo_defaulted')));

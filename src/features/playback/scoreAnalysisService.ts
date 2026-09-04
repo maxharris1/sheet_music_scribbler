@@ -22,8 +22,17 @@ export interface ScoreAnalysisStatusRow {
  * services/omr-service/src/job.ts: an analysis produced by an older engine
  * still plays, but is missing whatever that bump added, and nothing else in
  * the system ever re-runs it — so the reader has to be offered the choice.
+ *
+ * This number follows the service's only when the bump changed what a score
+ * SOUNDS like. svc-6 was page sharding — the same PDF in, byte-for-byte the
+ * same ScoreData out, only sooner — so it deliberately stayed behind at 5
+ * rather than asking every reader to regenerate an identical analysis. svc-7
+ * (D.C./D.S. roadmaps, the tempo map surviving a shard merge, pedal) changes
+ * the performance, so it is worth the interruption. svc-8 seeds expression
+ * across the page-cut seam, which changes what every 4+ page score sounds like.
+ * svc-9 realises ornaments, appoggiaturas, tempo-relative graces and swing.
  */
-export const CURRENT_ENGINE_GENERATION = 5;
+export const CURRENT_ENGINE_GENERATION = 9;
 
 const engineGeneration = (engineVersion: string | null): number | null => {
     const match = /\+svc-(\d+)$/.exec(engineVersion ?? '');

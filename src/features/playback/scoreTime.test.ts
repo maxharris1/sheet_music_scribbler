@@ -3,18 +3,23 @@ import { describe, expect, it } from 'vitest';
 import { tinyScore } from '@/features/playback/fixtures/tinyScore';
 import {
     beatsForMeasure,
+    beatWeight,
     bpmAtTick,
     buildTempoMap,
     clickBeatTicks,
     secondsAtTick,
     tickAtSeconds,
     countInClicks,
+    DOWNBEAT_ACCENT,
+    FINAL_RIT_FACTOR,
+    finalRitardandoPoints,
     firstNoteIndexAtOrAfter,
     fractionWithinMeasure,
     measureEndTick,
     measureIndexAtPagePoint,
     measureIndexAtTick,
     measureStartTick,
+    SECONDARY_ACCENT,
     secondsPerTick,
     stepMeasure,
     tickAtXInMeasure,
@@ -22,7 +27,7 @@ import {
     timeSigAt,
     xAtTickInMeasure,
 } from '@/features/playback/scoreTime';
-import { parseScoreData, type ScoreData, type ScoreMeasure } from '@/types/scoreData';
+import { parseScoreData, type ScoreData, type ScoreMeasure, type ScoreTimeSig } from '@/types/scoreData';
 
 const { measures, notes, timeSignatures } = tinyScore;
 
@@ -226,6 +231,28 @@ describe('beatsForMeasure', () => {
     });
 });
 
+describe('beatWeight', () => {
+    const sig = (num: number, den: number): ScoreTimeSig => ({ tick: 0, num, den });
+
+    it('is a table of the common meters', () => {
+        expect(beatWeight(sig(4, 4), 0, true)).toBe(DOWNBEAT_ACCENT);
+        expect(beatWeight(sig(4, 4), 1, true)).toBe(0);
+        expect(beatWeight(sig(4, 4), 2, true)).toBe(SECONDARY_ACCENT);
+        expect(beatWeight(sig(4, 4), 3, true)).toBe(0);
+        expect(beatWeight(sig(2, 2), 1, true)).toBe(0);
+        expect(beatWeight(sig(2, 4), 1, true)).toBe(0);
+        expect(beatWeight(sig(3, 4), 1, true)).toBe(0);
+        expect(beatWeight(sig(3, 4), 2, true)).toBe(0);
+        expect(beatWeight(sig(6, 8), 1, true)).toBe(SECONDARY_ACCENT);
+        expect(beatWeight(sig(12, 8), 1, true)).toBe(0);
+        expect(beatWeight(sig(12, 8), 2, true)).toBe(SECONDARY_ACCENT);
+        expect(beatWeight(sig(9, 8), 1, true)).toBe(0);
+        expect(beatWeight(sig(3, 8), 1, true)).toBe(0);
+        expect(beatWeight(sig(4, 4), 0, false)).toBe(0);
+        expect(beatWeight(sig(4, 4), 2, false)).toBe(0);
+    });
+});
+
 describe('countInClicks', () => {
     it('is one plain bar when entering on a downbeat', () => {
         expect(countInClicks(tinyScore, 480)).toEqual([
@@ -284,7 +311,10 @@ describe('tempo map', () => {
             100,
         );
         expect(secondsAtTick(map, 7680)).toBeCloseTo(8, 6); // 4 bars at 120
-        expect(secondsAtTick(map, 15360)).toBeCloseTo(24, 6); // + 4 bars at 60
+        // Past the printed change the unmarked close still stretches the last
+        // bar, so 15360 is no longer a flat 16 s at 60. Arriving at m.8 (the
+        // last barline before the rit.) is still five seconds of 60.
+        expect(secondsAtTick(map, 12480)).toBeCloseTo(18, 6);
     });
 
     it('inverts exactly', () => {
@@ -363,9 +393,93 @@ describe('tempo map', () => {
 
     it('reduces to a flat map for a score with no tempo data', () => {
         const map = buildTempoMap({ ...tinyScore, defaultBpm: null }, 1, 100);
-        // Falls back to the supplied bpm, exactly as before v3.
+        // Falls back to the supplied bpm, exactly as before v3. The unmarked
+        // close still bends the last bar; the body of the piece is flat.
         expect(secondsAtTick(map, 480)).toBeCloseTo(60 / 100, 6);
-        expect(bpmAtTick(map, 99999)).toBeCloseTo(100, 6);
+        expect(bpmAtTick(map, 480)).toBeCloseTo(100, 6);
+        expect(bpmAtTick(map, 0)).toBeCloseTo(100, 6);
+    });
+});
+
+describe('finalRitardandoPoints', () => {
+    const bar = (n: number, tick: number, dTicks: number, srcIndex: number): ScoreMeasure => ({
+        n,
+        tick,
+        dTicks,
+        page: 0,
+        sys: 0,
+        x0: 0,
+        x1: 1,
+        srcIndex,
+    });
+
+    const fourBar44 = (over: Partial<ScoreData> = {}): ScoreData => ({
+        ...tinyScore,
+        defaultBpm: 120,
+        totalTicks: 7680,
+        timeSignatures: [{ tick: 0, num: 4, den: 4 }],
+        tempos: [{ tick: 0, bpm: 120 }],
+        holds: undefined,
+        measures: [0, 1, 2, 3].map((i) => bar(i + 1, i * 1920, 1920, i)),
+        notes: [],
+        ...over,
+    });
+
+    it('eases the last full bar of a 4/4 score down to 85% on the last beat', () => {
+        const points = finalRitardandoPoints(fourBar44(), 120);
+        expect(points).toHaveLength(4);
+        for (let k = 0; k < 4; k++) {
+            expect(points[k]?.tick).toBe(5760 + 480 * k);
+        }
+        expect(points[0]?.bpm).toBe(120);
+        expect(points[3]?.bpm).toBe(120 * FINAL_RIT_FACTOR);
+        expect(points[3]?.bpm).toBe(102);
+        expect(points[1]?.bpm).toBeCloseTo(114, 10);
+        expect(points[2]?.bpm).toBeCloseTo(108, 10);
+    });
+
+    it('is suppressed by a ramp point in the last two bars', () => {
+        const withRamp = fourBar44({
+            tempos: [
+                { tick: 0, bpm: 120 },
+                { tick: 4000, bpm: 100, src: 'ramp' },
+            ],
+        });
+        expect(finalRitardandoPoints(withRamp, 120)).toEqual([]);
+    });
+
+    it('is suppressed by a hold in the last bar', () => {
+        const withHold = fourBar44({ holds: [{ tick: 6000, beats: 2 }] });
+        expect(finalRitardandoPoints(withHold, 120)).toEqual([]);
+    });
+
+    it('emits points before both ends of a two-movement score', () => {
+        const twoMovements = fourBar44({
+            measures: [bar(1, 0, 1920, 0), bar(2, 1920, 1920, 1), bar(1, 3840, 1920, 2), bar(2, 5760, 1920, 3)],
+        });
+        const points = finalRitardandoPoints(twoMovements, 120);
+        const ticks = points.map((p) => p.tick);
+        expect(ticks).toEqual([1920, 2400, 2880, 3360, 5760, 6240, 6720, 7200]);
+        expect(points[3]?.bpm).toBe(102);
+        expect(points[7]?.bpm).toBe(102);
+    });
+
+    it('ignores a numbering reset whose srcIndex goes down — that is a repeat, not a movement', () => {
+        const repeated = fourBar44({
+            measures: [bar(1, 0, 1920, 0), bar(2, 1920, 1920, 1), bar(1, 3840, 1920, 0), bar(2, 5760, 1920, 1)],
+        });
+        const ticks = finalRitardandoPoints(repeated, 120).map((p) => p.tick);
+        expect(ticks).toEqual([5760, 6240, 6720, 7200]);
+    });
+
+    it('makes the last bar longer than the metronomic duration by the expected amount', () => {
+        const score = fourBar44();
+        const map = buildTempoMap(score, 1, 120);
+        const spt = (bpm: number): number => 60 / (bpm * 480);
+        const lastBar = 480 * spt(120) + 480 * spt(114) + 480 * spt(108) + 480 * spt(120 * FINAL_RIT_FACTOR);
+        expect(secondsAtTick(map, 5760)).toBeCloseTo(6, 6);
+        expect(secondsAtTick(map, 7680)).toBeCloseTo(6 + lastBar, 6);
+        expect(secondsAtTick(map, 7680)).toBeGreaterThan(8);
     });
 });
 
